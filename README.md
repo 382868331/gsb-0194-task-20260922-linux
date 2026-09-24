@@ -1,7 +1,9 @@
-# distortion — 透镜畸变映射的可逆区域检查
+# distortion — 透镜畸变映射的可逆区域检查与径向系数拟合
 
 在归一化平面上对四系数多项式透镜畸变模型做**前向映射**与**有界盒逆解**，
-并在纯径向下给出**分段单调性唯一性/无解证书**。仅使用 Python 3.14
+并在纯径向下给出**分段单调性唯一性/无解证书**；另在**固定焦距 f 与主点
+(cx, cy)** 下，从带权点对应**拟合单个径向系数 k1**，给出迭代预算、残差
+与收敛状态，退化点集返回诊断。仅使用 Python 3.14
 标准库，离线可导入，无第三方依赖，不调用任何同类第三方实现替代核心算法。
 
 ## 环境与运行
@@ -13,8 +15,8 @@
 准确命令（在仓库根目录执行）：
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（约 0.5 秒）
-python demo.py                            # 固定输入演示（实测 < 1 秒，预算约 8 秒）
+python -m unittest discover -s tests -v   # 必要测试（38 个，约 0.5 秒）
+python demo.py                            # 固定输入演示（实测 < 0.1 秒，预算约 90 秒）
 ```
 
 ## 数学模型（本题契约的精确子集）
@@ -31,7 +33,8 @@ r² = x² + y²
 ## 公开接口
 
 ```python
-from distortion import DistortionModel, Candidate, InverseResult, finite_real
+from distortion import (DistortionModel, Candidate, InverseResult,
+                       RadialFitResult, fit_radial_k1, finite_real)
 
 m = DistortionModel(k1=0.0, k2=0.0, p1=0.0, p2=0.0)
 
@@ -77,6 +80,54 @@ results = m.undistort_all([(xp, yp), ...], R, **同上)
   模型本身无状态，不存在未说明的部分变更。
 - **搜索预算耗尽与证明无解严格分开**：通用 Newton 路径永不置
   `proven_no_solution`；证书无解只可能来自径向分段路径。
+
+### 固定内参的带权 k1 拟合
+
+```python
+res: RadialFitResult = fit_radial_k1(
+    correspondences,          # 1..100 个 ((x, y), (u, v))
+    f, cx, cy,                # 固定已知的焦距与主点（像素单位）
+    weights=None,             # None=全 1，或每个对应一个 >0 的有限权重
+    initial_k1=0.0,           # 迭代初值（有限实数）
+    max_iterations=20)        # 1..10000 的真整数，迭代预算
+```
+
+`(x, y)` 是归一化平面坐标（即 `DistortionModel.distort` 的输入域），
+`(u, v)` 是观测到的像素坐标。沿用原前向公式并取 `k2 = p1 = p2 = 0`：
+
+```
+u = f·x·(1 + k1·r²) + cx ,  v = f·y·(1 + k1·r²) + cy ,  r² = x² + y²
+```
+
+最小化带权目标
+`C = Σ_i w_i[(u_i − û_i)² + (v_i − v̂_i)²]`。求解器是带 Armijo
+回退的**标量 Gauss-Newton 迭代**；对应固定时目标对 k1 是线性的，
+故一个接受步即到达唯一的全局带权最小二乘解，迭代循环只负责如实执行
+预算与收敛判定。
+
+`RadialFitResult` 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `k1` | 拟合系数（退化时保持 `initial_k1`） |
+| `initial_k1` / `f` / `cx` / `cy` | 已校验的入参回显 |
+| `model` | `DistortionModel(k1=k1)`，直接复用原前向模型与逆解 |
+| `n_points` / `total_weight` | 对应点数与权重和 |
+| `cost` | 带权残差平方和（像素²） |
+| `rms` | `sqrt(cost/total_weight)`，带权 RMS 点距（像素） |
+| `iterations` / `max_iterations` | 已接受步数 / 迭代预算 |
+| `converged` | 等价于 `status == "converged"` |
+| `status` | `"converged"` / `"max_iterations"` / `"degenerate"` |
+| `observability` | `sqrt(A) = f·sqrt(Σ w_i r_i⁶)`；0 表示 k1 不可观测 |
+| `diagnostic` | 人类可读的收敛/退化说明 |
+
+**退化几何是诊断而非异常**：所有对应都在归一化原点 `r = 0` 时
+`A = f²Σw_i r_i⁶ = 0`，k1 不进入预测、不可观测，返回
+`status="degenerate"`、`iterations=0`、`k1=initial_k1`，并仍报告主点
+预测处的实际 RMS 残差；消息提示加入远离原点的对应。非法输入
+（`f ≤ 0`、权重 ≤ 0 或数量不符、NaN/Infinity、`bool` 冒充实整数、
+0 个或超过 100 个对应、结构错误）在任何迭代前抛 `TypeError`/
+`ValueError` 且消息带字段名；拟合器是纯函数，不存在半更新状态。
 
 ## 算法与设计取舍
 
@@ -153,6 +204,21 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
   段间）。彼此比去重距离更近的两个真根会被当作一个候选——这是已知
   分辨率限制（见下）。
 
+### k1 拟合的误差口径
+
+- 法方程标量 `A = f²Σw r⁶`、右端 `b = Σw f r²(x·t_x + y·t_y)`
+  直接双精度累加；线性问题的 GN 步 `k = b/A` 即全局最小二乘解。
+  精确合成数据下，从原始点直接重投影得到的 RMS 残差通常
+  `≤ 1e-12·f·max(1,|坐标|)` 像素（f≈700 时实测约 6e-14 px）。
+- **最终残差按原始点直接重投影计算**，不用线搜索内部的闭式二次式
+  `c0 − 2kb + k²A`——后者在最小点附近有灾难性抵消，会把精确拟合
+  夸大成 1e-8 px 的假残差；二次式只用于步长选择。
+- 收敛判据是下一步 GN 步长 `|Δk| ≤ 1e-12·max(1,|k1|)`；线性问题
+  一步即满足。`observability = √A` 是几何可观性指标：越小则同等
+  像素噪声下 k1 估计方差越大，恰好为 0 即退化。
+- 权重为相对权重；`rms = √(C/Σw)` 是按总权归一化的等效每坐标点距，
+  不把整体权重放大误读为残差缩小。
+
 ## 已知限制
 
 1. 通用（含切向）路径的多根集合是**数值搜索结果，不是完备证明**；
@@ -169,6 +235,15 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
 6. 只实现本题公式的 4 系数模型；不做相机标定、畸变系数约定转换或
    行业标准兼容性声明。
 7. 批量上限 100 是接口边界而非性能建议；演示用例不穷举该规模。
+8. 本次迭代的拟合**只估计单个径向系数 k1**，固定 f、cx、cy，且
+   `k2 = p1 = p2 = 0`；不做焦距/主点联合估计、多系数或切向系数
+   拟合、鲁棒离群筛除（无 RANSAC/Huber）。含离群点时应通过权重
+   降权，权重为 0 不被接受（请直接剔除该对应）。
+9. 退化只覆盖精确不可观（`A = 0`，即所有点 r=0）。`A` 极小但非零
+   的近退化几何不单独标记状态，只通过 `observability` 的小数值
+   体现；同等像素噪声下估计会相应不稳。
+10. 像素观测假定与归一化点对应关系正确、噪声近似零均值；不做
+    对应错配检测，错配会直接带偏 k1。
 
 ## 仓库结构
 
@@ -178,11 +253,14 @@ distortion/numeric.py     # 有限实数/整数校验
 distortion/model.py       # 前向模型、解析 Jacobian、批量接口
 distortion/radial.py      # 纯径向分段单调性证书求解
 distortion/inverse.py     # 结果类型、多起点阻尼 Newton、统一入口
-tests/test_distortion.py  # 独立参考 + 20 个测试
+distortion/fit.py         # 固定内参的带权单系数(k1) Gauss-Newton 拟合
+tests/test_distortion.py  # 前向/Jacobian/逆解：独立参考 + 21 个测试
+tests/test_fit.py         # k1 拟合：手算例/独立闭式解/噪声/退化/非法输入 + 17 个测试
 demo.py                   # 固定输入演示
 README.md
 ```
 
 测试中的期望值全部独立得到（手算解析例、独立临界点二次方程、稠密
-符号变化扫描、中心有限差分 Jacobian）；被测核心不用于生成期望值，
-distort↔undistort 往返仅作补充断言。
+符号变化扫描、中心有限差分 Jacobian，以及拟合测试中独立转写的闭式
+带权最小二乘 `k=b/A` 与确定性 LCG 噪声）；被测核心不用于生成期望值，
+distort↔undistort 往返、拟合模型重投影仅作补充断言。
