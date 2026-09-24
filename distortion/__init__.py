@@ -1,10 +1,12 @@
 """Lens distortion mapping and bounded-box invertibility checking.
 
 Public API:
-    DistortionModel  -- forward/distort and inverse/undistort operations
-    Candidate        -- one accepted inverse candidate
-    InverseResult    -- all accepted, de-duplicated candidates plus flags
-    finite_real      -- input validation helper
+    DistortionModel         -- forward/distort and inverse/undistort ops
+    Candidate               -- one accepted inverse candidate
+    InverseResult           -- all accepted, de-duplicated candidates + flags
+    RadialFitResult         -- result of a single-coefficient radial fit
+    fit_radial_coefficient  -- weighted fit of k1 with fixed intrinsics
+    finite_real             -- input validation helper
 
 Only Python 3.14 standard library is used.  This module implements the
 contract of this task only; it does NOT claim industry-standard camera
@@ -13,11 +15,14 @@ model compatibility.
 
 from .model import DistortionModel
 from .inverse import Candidate, InverseResult
+from .fit import RadialFitResult, fit_radial_coefficient
 from .numeric import finite_real
 
 __all__ = [
     "DistortionModel",
     "Candidate",
     "InverseResult",
+    "RadialFitResult",
+    "fit_radial_coefficient",
     "finite_real",
 ]

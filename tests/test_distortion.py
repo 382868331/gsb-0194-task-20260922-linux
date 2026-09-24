@@ -13,7 +13,9 @@ Run: python -m unittest discover -s tests -v
 import math
 import unittest
 
-from distortion import DistortionModel, Candidate, InverseResult, finite_real
+from distortion import (DistortionModel, Candidate, InverseResult,
+                        finite_real, fit_radial_coefficient,
+                        RadialFitResult)
 
 EPS = 2.220446049250313e-16
 
@@ -394,6 +396,331 @@ class TestValidation(unittest.TestCase):
             finite_real(1 + 2j)
         with self.assertRaises(ValueError):
             finite_real(float("inf"))
+
+
+class TestFitRadial(unittest.TestCase):
+    """Weighted single-coefficient radial fit (fixed intrinsics)."""
+
+    # Fixed undistorted normalized points (deterministic, off-axis).
+    BASE_POINTS = [(0.30, -0.20), (0.55, 0.41), (-0.48, 0.37),
+                   (0.12, 0.63), (-0.61, -0.29), (0.72, -0.05),
+                   (-0.18, -0.52), (0.44, 0.48)]
+
+    def _make_correspondences(self, k_true, *, weights=None, noise=None,
+                              fx=1.0, fy=1.0, cx=0.0, cy=0.0):
+        """Build pixel-frame records from the model formula directly.
+
+        ``noise`` is an optional deterministic (a, b) offset callable.
+        Expected values for the fit are derived separately in each test
+        via the closed-form weighted LS expression, never via the fitter.
+        """
+        recs = []
+        for i, (a, b) in enumerate(self.BASE_POINTS):
+            q = a * a + b * b
+            c = a * (1.0 + k_true * q)
+            d = b * (1.0 + k_true * q)
+            if noise is not None:
+                na, nb = noise(i)
+                c += na
+                d += nb
+            u, v = fx * a + cx, fy * b + cy
+            ud, vd = fx * c + cx, fy * d + cy
+            if weights is None:
+                recs.append((u, v, ud, vd))
+            else:
+                recs.append((u, v, ud, vd, weights[i]))
+        return recs
+
+    @staticmethod
+    def _closed_form_k1(points_norm, weights, k_true_ignored=None):
+        """Independent weighted-LS optimum k* = num / den, with
+
+        num = sum w q (a(c-a) + b(d-b)),  den = sum w q^3,
+        where (c, d) are the OBSERVED normalized coordinates.  This is
+        derived by differentiating the weighted SSE of the task's radial
+        formula; it does not call the package under test.
+        """
+        num = den = 0.0
+        for (a, b, c, d), w in zip(points_norm, weights):
+            q = a * a + b * b
+            num += w * q * (a * (c - a) + b * (d - b))
+            den += w * q * q * q
+        return num / den
+
+    def _normalized_observations(self, k_true, *, noise=None):
+        out = []
+        for i, (a, b) in enumerate(self.BASE_POINTS):
+            q = a * a + b * b
+            c = a * (1.0 + k_true * q)
+            d = b * (1.0 + k_true * q)
+            if noise is not None:
+                na, nb = noise(i)
+                c += na
+                d += nb
+            out.append((a, b, c, d))
+        return out
+
+    def test_no_distortion_recovers_zero(self):
+        recs = self._make_correspondences(0.0)
+        r = fit_radial_coefficient(recs)
+        self.assertIsInstance(r, RadialFitResult)
+        self.assertEqual(r.status, "converged")
+        self.assertTrue(r.converged)
+        self.assertAlmostEqual(r.k1, 0.0, delta=1e-14)
+        self.assertAlmostEqual(r.sse, 0.0, delta=1e-28)
+        self.assertAlmostEqual(r.rms_residual, 0.0, delta=1e-14)
+        self.assertAlmostEqual(r.max_residual, 0.0, delta=1e-14)
+        self.assertLessEqual(r.iterations, r.max_iterations)
+        # The fitted model is a radial-only DistortionModel.
+        self.assertEqual((r.model.k1, r.model.k2, r.model.p1, r.model.p2),
+                         (r.k1, 0.0, 0.0, 0.0))
+
+    def test_hand_computed_two_weighted_points(self):
+        # Pencil-and-paper case:
+        #   (1,0) observed (0.75,0) implies k=-0.25, weight 3
+        #   (2,0) observed (1.2, 0) implies k=-0.10, weight 1
+        #   num = 3*1*(-0.25) + 1*8*(-0.8) = -7.15
+        #   den = 3*1 + 64 = 67
+        #   k* = -7.15/67
+        recs = [(1.0, 0.0, 0.75, 0.0, 3.0),
+                (2.0, 0.0, 1.2, 0.0, 1.0)]
+        r = fit_radial_coefficient(recs)
+        self.assertEqual(r.status, "converged")
+        self.assertAlmostEqual(r.k1, -7.15 / 67.0, delta=1e-14)
+        # Single unweighted point must fit exactly: k = (c/a - 1)/q.
+        r1 = fit_radial_coefficient([(1.0, 0.0, 0.75, 0.0)])
+        self.assertAlmostEqual(r1.k1, -0.25, delta=1e-14)
+        self.assertAlmostEqual(r1.sse, 0.0, delta=1e-28)
+
+    def test_recover_synthetic_coefficient_normalized(self):
+        for k_true in (-0.35, 0.22, -0.08):
+            with self.subTest(k_true=k_true):
+                recs = self._make_correspondences(k_true)
+                obs = self._normalized_observations(k_true)
+                expected = self._closed_form_k1(obs, [1.0] * len(obs))
+                r = fit_radial_coefficient(recs)
+                self.assertEqual(r.status, "converged")
+                self.assertAlmostEqual(r.k1, expected, delta=1e-13)
+                self.assertAlmostEqual(r.k1, k_true, delta=1e-12)
+                # Exact synthetic data: residuals at machine precision.
+                self.assertLessEqual(r.max_residual, 1e-13)
+                self.assertAlmostEqual(r.sse, 0.0, delta=1e-24)
+
+    def test_recover_synthetic_coefficient_pixel_frame(self):
+        # Non-trivial fixed intrinsics; k1 must be invariant to them.
+        fx, fy, cx, cy = 812.7, 811.9, 326.4, 241.3
+        k_true = -0.27
+        recs = self._make_correspondences(
+            k_true, fx=fx, fy=fy, cx=cx, cy=cy)
+        obs = self._normalized_observations(k_true)
+        expected = self._closed_form_k1(obs, [1.0] * len(obs))
+        r = fit_radial_coefficient(recs, fx=fx, fy=fy, cx=cx, cy=cy)
+        self.assertEqual(r.status, "converged")
+        self.assertAlmostEqual(r.k1, expected, delta=1e-12)
+        self.assertAlmostEqual(r.k1, k_true, delta=1e-11)
+        self.assertAlmostEqual(r.fx, fx)
+        self.assertAlmostEqual(r.cy, cy)
+        self.assertEqual(r.n_points, len(self.BASE_POINTS))
+
+    def test_weights_match_independent_closed_form(self):
+        weights = [2.0, 0.5, 1.0, 3.0, 0.25, 1.5, 0.0, 4.0]
+        k_true = -0.19
+        recs = self._make_correspondences(k_true, weights=weights)
+        obs = self._normalized_observations(k_true)
+        expected = self._closed_form_k1(obs, weights)
+        r = fit_radial_coefficient(recs)
+        self.assertEqual(r.status, "converged")
+        self.assertAlmostEqual(r.k1, expected, delta=1e-13)
+        self.assertAlmostEqual(r.weight_sum, sum(weights), delta=1e-12)
+
+    def test_noisy_observations(self):
+        # Deterministic LCG pseudo-noise (seeded constant, no RNG state
+        # leakage), amplitude ~1e-3 normalized.
+        state = 0x1234abcd
+
+        def noise(i):
+            nonlocal state
+            outs = []
+            for _ in range(2):
+                state = (1103515245 * state + 12345) & 0x7fffffff
+                outs.append(1e-3 * (state / 0x7fffffff - 0.5))
+            return outs[0], outs[1]
+
+        k_true = -0.3
+        recs = self._make_correspondences(k_true, noise=noise)
+        # Replay the identical noise for the independent expectation.
+        state = 0x1234abcd
+        obs = self._normalized_observations(k_true, noise=noise)
+        expected = self._closed_form_k1(obs, [1.0] * len(obs))
+
+        r = fit_radial_coefficient(recs)
+        self.assertEqual(r.status, "converged")
+        self.assertAlmostEqual(r.k1, expected, delta=1e-12)
+        # Independent SSE/RMS at the closed-form optimum.
+        sse0 = 0.0
+        for a, b, c, d in obs:
+            q = a * a + b * b
+            fa = c - a * (1.0 + expected * q)
+            fb = d - b * (1.0 + expected * q)
+            sse0 += fa * fa + fb * fb
+        self.assertAlmostEqual(r.sse, sse0, delta=1e-10 * max(1.0, sse0))
+        self.assertAlmostEqual(r.rms_residual,
+                               math.sqrt(sse0 / (2.0 * len(obs))),
+                               delta=1e-12)
+        # Noise bias stays an order of magnitude below the noise scale.
+        self.assertLess(abs(r.k1 - k_true), 1e-2)
+        # Fitted residuals are smaller than residuals at k = 0.
+        sse_at_zero = sum((c - a) ** 2 + (d - b) ** 2
+                          for a, b, c, d in obs)
+        self.assertLess(r.sse, sse_at_zero)
+
+    def test_iteration_budget_exhausted_status(self):
+        # The model is linear in k1, so force the residual step to
+        # outlive a one-iteration budget with an xtol below round-off.
+        recs = self._make_correspondences(-0.3)
+        r = fit_radial_coefficient(recs, initial_k1=5.0,
+                                   max_iterations=1, xtol=1e-18)
+        self.assertEqual(r.status, "max_iterations")
+        self.assertFalse(r.converged)
+        self.assertEqual(r.iterations, 1)
+        self.assertGreater(r.final_step, 1e-18)
+
+    def test_stalled_at_extreme_initial_value(self):
+        recs = self._make_correspondences(-0.3)
+        r = fit_radial_coefficient(recs, initial_k1=1e300)
+        self.assertEqual(r.status, "stalled")
+        self.assertFalse(r.converged)
+        self.assertEqual(r.iterations, 0)
+        self.assertEqual(r.k1, 1e300)  # no half-updated state
+        self.assertIn("stalled", r.diagnostic)
+
+    def test_legitimate_calls_still_work_afterward(self):
+        # The fitter is stateless: an extreme/degenerate call must not
+        # affect a subsequent ordinary call.
+        recs = self._make_correspondences(-0.3)
+        fit_radial_coefficient(recs, initial_k1=1e308)
+        fit_radial_coefficient([(0.0, 0.0, 0.1, 0.0)])
+        r = fit_radial_coefficient(recs)
+        self.assertEqual(r.status, "converged")
+        self.assertAlmostEqual(r.k1, -0.3, delta=1e-11)
+
+
+class TestFitRadialDegenerateAndInvalid(unittest.TestCase):
+    BASE = [(0.30, -0.20), (0.55, 0.41), (-0.48, 0.37), (0.12, 0.63)]
+
+    def _recs(self, k_true=-0.2):
+        out = []
+        for a, b in self.BASE:
+            q = a * a + b * b
+            out.append((a, b, a * (1 + k_true * q), b * (1 + k_true * q)))
+        return out
+
+    def test_all_zero_weights_is_diagnostic(self):
+        recs = [(u, v, ud, vd, 0.0) for u, v, ud, vd in self._recs()]
+        r = fit_radial_coefficient(recs)
+        self.assertEqual(r.status, "degenerate")
+        self.assertFalse(r.converged)
+        self.assertEqual(r.iterations, 0)
+        self.assertEqual(r.final_step, 0.0)
+        self.assertEqual(r.k1, 0.0)
+        self.assertEqual(r.weight_sum, 0.0)
+        self.assertIn("zero", r.diagnostic)
+
+    def test_all_points_at_principal_point_is_diagnostic(self):
+        # Nonzero observations at the principal point cannot be modelled
+        # by radial scaling (the origin is fixed), so this is degenerate.
+        recs = [(0.0, 0.0, 0.01, -0.02, 1.0),
+                (0.0, 0.0, -0.03, 0.0, 2.0)]
+        r = fit_radial_coefficient(recs)
+        self.assertEqual(r.status, "degenerate")
+        self.assertEqual(r.iterations, 0)
+        self.assertEqual(r.k1, 0.0)
+        self.assertIn("principal point", r.diagnostic)
+        # Echoed residual metrics remain finite and honestly computed.
+        self.assertTrue(math.isfinite(r.rms_residual))
+        self.assertGreater(r.max_residual, 0.0)
+
+    def test_sub_roundoff_leverage_is_diagnostic(self):
+        # Coordinates so small that q^3 vanishes in double precision:
+        # no digit of k1 is observable, even though points are off-axis.
+        recs = [(1e-160, 0.0, 1e-160, 0.0, 1.0),
+                (0.0, 2e-160, 0.0, 2e-160, 1.0)]
+        r = fit_radial_coefficient(recs)
+        self.assertEqual(r.status, "degenerate")
+        self.assertEqual(r.k1, 0.0)
+        self.assertIn("leverage", r.diagnostic)
+
+    def test_degenerate_result_echoes_initial_value(self):
+        recs = [(0.0, 0.0, 0.1, 0.0, 1.0)]
+        r = fit_radial_coefficient(recs, initial_k1=-0.42)
+        self.assertEqual(r.status, "degenerate")
+        self.assertEqual(r.k1, -0.42)
+        self.assertEqual(r.initial_k1, -0.42)
+
+    def test_zero_weight_records_ignored_among_good_ones(self):
+        good = self._recs()
+        recs = good + [(9.9, 9.9, -9.9, -9.9, 0.0)]
+        r_all = fit_radial_coefficient(good)
+        r = fit_radial_coefficient(recs)
+        self.assertEqual(r.status, "converged")
+        self.assertAlmostEqual(r.k1, r_all.k1, delta=1e-14)
+
+    def test_empty_and_malformed_batches(self):
+        with self.assertRaises(ValueError):
+            fit_radial_coefficient([])
+        with self.assertRaises(TypeError):
+            fit_radial_coefficient("nope")
+        with self.assertRaises(TypeError):
+            fit_radial_coefficient([(0.1, 0.2, 0.3)])          # too short
+        with self.assertRaises(TypeError):
+            fit_radial_coefficient([(0.1, 0.2, 0.3, 0.4, 1.0, 2.0)])
+        with self.assertRaises(TypeError):
+            fit_radial_coefficient([[(0.1, 0.2, 0.3, 0.4)]])   # nested
+
+    def test_non_finite_and_negative_weight(self):
+        good = (0.1, 0.2, 0.3, 0.4)
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValueError):
+                fit_radial_coefficient([(bad, 0.2, 0.3, 0.4)])
+            with self.assertRaises(ValueError):
+                fit_radial_coefficient([(0.1, bad, 0.3, 0.4)])
+            with self.assertRaises(ValueError):
+                fit_radial_coefficient([(0.1, 0.2, bad, 0.4)])
+            with self.assertRaises(ValueError):
+                fit_radial_coefficient([(0.1, 0.2, 0.3, 0.4, bad)])
+            with self.assertRaises(ValueError):
+                fit_radial_coefficient([good], fx=bad)
+            with self.assertRaises(ValueError):
+                fit_radial_coefficient([good], initial_k1=bad)
+        with self.assertRaises(ValueError):
+            fit_radial_coefficient([(0.1, 0.2, 0.3, 0.4, -0.1)])
+
+    def test_bad_intrinsics_and_options(self):
+        recs = self._recs()
+        for fx in (0.0, -1.0):
+            with self.assertRaises(ValueError):
+                fit_radial_coefficient(recs, fx=fx)
+        with self.assertRaises(ValueError):
+            fit_radial_coefficient(recs, fy=-2.0)
+        with self.assertRaises(ValueError):
+            fit_radial_coefficient(recs, xtol=0.0)
+        with self.assertRaises(ValueError):
+            fit_radial_coefficient(recs, max_iterations=0)
+        with self.assertRaises(ValueError):
+            fit_radial_coefficient(recs, max_iterations=10001)
+        with self.assertRaises(TypeError):
+            fit_radial_coefficient(recs, max_iterations=True)
+        with self.assertRaises(TypeError):
+            fit_radial_coefficient(recs, max_iterations=2.0)
+        with self.assertRaises(TypeError):
+            fit_radial_coefficient(recs, fx=True)
+
+    def test_whole_batch_validated_before_computation(self):
+        # A bad record late in the batch must raise (no partial output
+        # exists: the call is atomic and returns nothing).
+        recs = self._recs() + [(0.0, float("nan"), 0.0, 0.0)]
+        with self.assertRaises(ValueError):
+            fit_radial_coefficient(recs)
 
 
 if __name__ == "__main__":
