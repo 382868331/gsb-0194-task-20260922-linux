@@ -4,6 +4,12 @@
 并在纯径向下给出**分段单调性唯一性/无解证书**。仅使用 Python 3.14
 标准库，离线可导入，无第三方依赖，不调用任何同类第三方实现替代核心算法。
 
+本版新增**连续分支跟踪入口**：给定一串畸变后坐标和首个未畸变锚点，逐帧
+仍由原求解器给出全部残差合格候选，再选距上一结果最近且不超过显式步长
+上限的根；等距根在容差内判为 ambiguous，绝不按列表顺序偷选；无候选或
+越步即断开轨迹，必须用新锚点才能继续。跟踪只是分支连续性启发式，**不
+改变逆函数的多根性质**，原完备性限制与径向证书逐帧保留。
+
 ## 环境与运行
 
 - Python：**3.14.7**（仅用标准库 `math`；3.10+ 亦可运行，但以 3.14.7 为准）
@@ -13,8 +19,8 @@
 准确命令（在仓库根目录执行）：
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（约 0.5 秒）
-python demo.py                            # 固定输入演示（实测 < 1 秒，预算约 8 秒）
+./.venv/bin/python -m unittest discover -s tests -v   # 全部测试（含跟踪）
+./.venv/bin/python demo.py                            # 固定输入演示（实测 < 1 秒，预算 90 秒）
 ```
 
 ## 数学模型（本题契约的精确子集）
@@ -31,7 +37,10 @@ r² = x² + y²
 ## 公开接口
 
 ```python
-from distortion import DistortionModel, Candidate, InverseResult, finite_real
+from distortion import (DistortionModel, Candidate, InverseResult,
+                        TrackStep, TrackResult, track_undistorted,
+                        OK, AMBIGUOUS, NO_CANDIDATE, OVER_STEP,
+                        INVALID_ANCHOR, NEEDS_ANCHOR, finite_real)
 
 m = DistortionModel(k1=0.0, k2=0.0, p1=0.0, p2=0.0)
 
@@ -45,6 +54,50 @@ res: InverseResult = m.undistort(xp, yp, R,
                                  starts_per_axis=5,    # 1..12 的真整数
                                  max_iterations=80)    # 1..10000 的真整数
 results = m.undistort_all([(xp, yp), ...], R, **同上)
+
+# 连续分支跟踪：一串畸变坐标 + 首个未畸变锚点
+track = m.track(
+    [(xp0, yp0), (xp1, yp1), ...],  # 畸变后坐标，1..100 个
+    anchor=(x0, y0),                 # targets[0] 的未畸变锚点（盒内）
+    R=3.0,
+    max_step=0.05,                   # 必填：未畸变坐标上的逐帧步长硬上限
+    tie_tol=1e-9,                    # 距离差 <= tie_tol 视为同距 -> ambiguous
+    anchor_tol=1e-8,                 # 锚点正向校验残差上限
+    resume_anchors={3: (x3, y3)},    # 可选：断点后某帧的新锚点
+    residual_tol=1e-10,              # 以下参数原样透传给原求解器
+    starts_per_axis=5, max_iterations=80)
+# 或函数式：track_undistorted(m, targets, anchor, R, max_step=..., ...)
+for step in track:                   # step: TrackStep
+    step.status                      # OK / AMBIGUOUS / NO_CANDIDATE /
+                                     # OVER_STEP / INVALID_ANCHOR / NEEDS_ANCHOR
+    step.x, step.y, step.distance    # 选中根与到上一根的距离
+    step.candidates                  # 该帧原求解器的全部合格候选（始终保留）
+    step.proven_no_solution          # 逐帧保留的径向无解证书
+    step.budget_exhausted            # 逐帧保留的数值完备性限制标志
+track.active        # 末帧是否仍在轨迹上
+track.broken        # 是否曾断开
+track.break_index   # 首个断点帧号（无则 None）
+track.last          # 最近一个被选根 (x, y) 或 None
+
+**跟踪语义（每帧）**
+
+- 第 0 帧必须给出锚点，且通过**正向校验**：
+  残差 ‖distort(anchor) − target‖ ≤ anchor_tol，否则该帧为
+  INVALID_ANCHOR，轨迹立即断开。求解器仍照常运行并保留候选。
+- 之后每帧先调用原 undistort_points 得到全部残差合格候选，再取距上一
+  选中根欧氏距离最小者：
+  - 最近距离 > max_step → OVER_STEP，宁断不跳；
+  - 有两个及以上候选的距离与最小距离之差 ≤ tie_tol → AMBIGUOUS，
+    **不选根、不按候选列表顺序决断**，候选全部保留；
+  - 无候选 → NO_CANDIDATE（径向路径可同时带 proven_no_solution）。
+- 上述任一情况都**断开轨迹**：其后帧在没有新锚点前为 NEEDS_ANCHOR，
+  且**不再运行求解器**；新锚点通过 resume_anchors={帧号: (x,y)} 给出，
+  与首锚点同样做盒内检查和正向校验。
+- 步长、容差都是**未畸变平面坐标**上的绝对距离；调用方必须显式给出
+  max_step（没有默认步长，避免静默跳跃）。
+- 跟踪不把逆函数变成唯一解：每帧 candidates、proven_no_solution、
+  budget_exhausted 与证书路径标志原样保留；切向（通用）路径的多根
+  集合仍是数值搜索结果，不证明完备；径向特例仍走分段证书。
 ```
 
 `InverseResult` 字段：
@@ -132,9 +185,29 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
   （`1e-8·max(1,R)`），按残差升序。
 - 在未解析点（含 `‖f‖²` 的伪局部极小）结束的起点计入预算标志；即使
   已找到候选，该标志仍诚实保留。**有限起点+有限迭代不证明完备**，
-  `certificate` 文本与 README 均显式声明。
+  certificate 文本与 README 均显式声明。
 
 ## 浮点结果的误差口径
+
+### 连续分支跟踪：最近根 + 显式步长上限（不取首根）
+
+逆解返回的 candidates 按残差排序，与几何上的“同一分支”无关；逐帧
+取列表第一根会在折叠映射上随机跳支。跟踪入口（distortion.tracking）
+因此：
+
+1. 第 0 帧只接受调用方显式给出的未畸变锚点，并做正向校验
+   （残差 <= anchor_tol）；锚点必须在闭盒内。
+2. 每一帧原求解器照常完整运行（径向上仍是分段证书，通用情形仍是
+   多起点 Newton），候选、证书、预算标志全部保留在 TrackStep 上。
+3. 在合格候选中选距上一选中点欧氏距离最小者；最小距离超过显式
+   max_step 即断开，绝不硬跳。
+4. 两个以上候选到上一点的距离差在 tie_tol 内时判 AMBIGUOUS：不选根、
+   不参考列表顺序，候选原样保留。
+5. 断点之后求解器停止运行，帧状态为 NEEDS_ANCHOR，直到调用方在
+   resume_anchors 给出新锚点（同样正向校验）才续跟。
+
+该机制只利用“相邻帧未畸变坐标变化不大”的连续性假设，不改变、也不
+声称逆函数唯一；通用路径的完备性限制与径向特例证书逐帧可见。
 
 - 前向映射：直接按 IEEE-754 双精度求值，单份坐标的典型相对误差
   `O(ε)`（ε≈2.22e-16）；系数与坐标在 `|·| ≲ O(1)` 时绝对误差量级
@@ -169,6 +242,9 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
 6. 只实现本题公式的 4 系数模型；不做相机标定、畸变系数约定转换或
    行业标准兼容性声明。
 7. 批量上限 100 是接口边界而非性能建议；演示用例不穷举该规模。
+8. 连续分支跟踪的"最近根 + 步长上限"是**启发式**，不证明所选根对应
+   物理上正确的轨迹；帧间真实运动超过 max_step 时会被当作断开处理。
+   同距歧义必须由调用方用新锚点解决，库不做任意裁决。
 
 ## 仓库结构
 
@@ -178,7 +254,10 @@ distortion/numeric.py     # 有限实数/整数校验
 distortion/model.py       # 前向模型、解析 Jacobian、批量接口
 distortion/radial.py      # 纯径向分段单调性证书求解
 distortion/inverse.py     # 结果类型、多起点阻尼 Newton、统一入口
+distortion/tracking.py    # 连续分支跟踪（最近根 + 显式步长上限 + 断点/锚点）
 tests/test_distortion.py  # 独立参考 + 20 个测试
+tests/test_tracking.py    # 跟踪测试：唯一分支/折返/同距歧义/错锚点/中断续跟；
+                          # 径向一维截面用独立 Decimal 高精度分段找根核对
 demo.py                   # 固定输入演示
 README.md
 ```
@@ -186,3 +265,6 @@ README.md
 测试中的期望值全部独立得到（手算解析例、独立临界点二次方程、稠密
 符号变化扫描、中心有限差分 Jacobian）；被测核心不用于生成期望值，
 distort↔undistort 往返仅作补充断言。
+跟踪测试中被选根对照的"一维径向真根集合"由测试文件内独立的
+decimal_roots_g_eq（标准库 decimal，50 位有效数字、2 万点扫描 +
+180 次二分，按区间斜率选择收敛分支）给出，不调用 distortion.radial。

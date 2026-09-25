@@ -96,6 +96,16 @@ class DistortionModel:
         return [undistort_points(self, tx, ty, R, **kwargs)
                 for (tx, ty) in cleaned]
 
+    def track(self, targets, anchor, R, *, max_step, **kwargs):
+        """Track one continuous inverse branch; see
+        distortion.tracking.track_undistorted.
+
+        Returns a distortion.tracking.TrackResult.
+        """
+        from .tracking import track_undistorted
+        return track_undistorted(self, targets, anchor, R,
+                                 max_step=max_step, **kwargs)
+
     def _distort(self, x, y):
         r2 = x * x + y * y
         radial = 1.0 + (self.k1 + self.k2 * r2) * r2

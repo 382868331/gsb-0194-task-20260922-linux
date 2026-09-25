@@ -8,14 +8,19 @@ Runs real computation (no sleep, no pre-recorded results) and prints:
   3. the same fold with a small tangential term solved by multi-start
      damped Newton,
   4. a proven no-solution case, and
-  5. actually triggered input rejections.
+  5. actually triggered input rejections,
+  6. continuous-branch tracking across a fold: per-frame candidates,
+     the selected nearest root, an ambiguous tie, a break, and resume.
 
-Run:  python demo.py     (completes in well under 8 seconds)
+Run:  ./.venv/bin/python demo.py   (completes in well under 1 second;
+      the allowed budget is 90 seconds)
 """
 
 import time
 
 from distortion import DistortionModel
+from distortion import (AMBIGUOUS, INVALID_ANCHOR, NEEDS_ANCHOR,
+                         NO_CANDIDATE, OK, OVER_STEP)
 
 
 def banner(title):
@@ -74,10 +79,8 @@ def main():
     s2, _ = general_model.distort(src_r, 0.0)
     result2 = general_model.undistort(s2, 0.0, R=3.0)
     show_result(general_model, result2)
-    print("  numerical search found all the basins here but does NOT "
-          "prove")
-    print("  completeness: further preimages outside the sampled "
-          "attraction")
+    print("  numerical search found all the basins here but does NOT prove")
+    print("  completeness: further preimages outside the sampled attraction")
     print("  basins cannot be excluded by a finite search.")
 
     banner("4. Proven NO SOLUTION (target outside what the box can reach)")
@@ -113,6 +116,75 @@ def main():
         print(f"      raised {exc_name}: {message}")
     print("  invalid inputs raise before any solving; no result list is")
     print("  ever partially built.")
+
+    banner("6. Continuous-branch tracking (nearest root, explicit step cap)")
+    print("  folding radial model k1=-0.8, k2=0.1; tracking the OUTER")
+    print("  preimage branch inward toward the turning point rc ~= 0.679,")
+    print("  then a deliberate jump beyond max_step breaks the track;")
+    print("  a new anchor resumes it.  Each frame prints every candidate")
+    print("  the original solver accepted, with the selected root marked.")
+
+    track_model = DistortionModel(k1=-0.8, k2=0.1)
+    outer_radii = [0.80, 0.77, 0.74, 0.71]
+    targets = [track_model.distort(r, 0.0) for r in outer_radii]
+    jump_target = track_model.distort(2.2, 0.0)
+    resume_target = track_model.distort(2.25, 0.0)
+    targets += [jump_target, resume_target]
+    res = track_model.track(
+        targets, (0.80, 0.0), R=3.0, max_step=0.05,
+        resume_anchors={5: (2.25, 0.0)})
+
+    label_map = {
+        OK: "ok (branch continued)",
+        AMBIGUOUS: "ambiguous (equidistant roots, none chosen)",
+        NO_CANDIDATE: "no candidate",
+        OVER_STEP: "over step cap -> broken",
+        INVALID_ANCHOR: "invalid anchor -> broken",
+        NEEDS_ANCHOR: "waiting for a new anchor",
+    }
+    for step in res:
+        tx, ty = targets[step.index]
+        print(f"  frame {step.index}: target = ({tx:.9f}, {ty:.9f})")
+        print(f"    status : {label_map[step.status]}")
+        if step.x is not None:
+            print(f"    picked : x = {step.x:+.10f}  "
+                  f"distance = {step.distance:.4e}  "
+                  f"[{step.method}]")
+        for j, c in enumerate(step.candidates):
+            mark = " <== picked" if (step.x is not None
+                                     and c.x == step.x) else ""
+            print(f"      candidate {j}: x = {c.x:+.10f}  "
+                  f"residual = {c.residual:.2e}{mark}")
+        if step.status == OVER_STEP:
+            print("    " + step.reason)
+        if step.status == NEEDS_ANCHOR:
+            print("    " + step.reason)
+    print("  ambiguity demo (separate short run, k1=-0.3): the previous")
+    print("  point bisects the two roots, so both are equally close and")
+    print("  tracking refuses to use list order as a tie-breaker.")
+    tie_model = DistortionModel(k1=-0.3)
+
+    def g(r):
+        return r * (1.0 - 0.3 * r * r)
+
+    s_tie = g(1.35)
+    # Small root of g(r) = s_tie, bracketed independently here for the
+    # demo geometry only.
+    lo, hi = 0.0, 1.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if g(mid) < s_tie:
+            lo = mid
+        else:
+            hi = mid
+    r_small = 0.5 * (lo + hi)
+    a = 0.5 * (r_small + 1.35)
+    tie_res = tie_model.track(
+        [tie_model.distort(a, 0.0), (s_tie, 0.0)],
+        (a, 0.0), R=2.0, max_step=1.0, tie_tol=1e-7)
+    ts = tie_res.steps[1]
+    print(f"    frame 1: {ts.status}; {len(ts.candidates)} candidates "
+          f"retained; reason: {ts.reason}")
 
     elapsed = time.perf_counter() - t0
     banner(f"done in {elapsed:.3f} s (budget ~ 8 s)")
