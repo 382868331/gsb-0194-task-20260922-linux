@@ -14,10 +14,32 @@ model compatibility.
 from .model import DistortionModel
 from .inverse import Candidate, InverseResult
 from .numeric import finite_real
+from .tracking import (
+    TrackStep,
+    InverseTracker,
+    track_points,
+    ANCHORED,
+    OK,
+    AMBIGUOUS,
+    NO_CANDIDATE,
+    STEP_TOO_LARGE,
+    ANCHOR_REJECTED,
+    BROKEN_NEEDS_ANCHOR,
+)
 
 __all__ = [
     "DistortionModel",
     "Candidate",
     "InverseResult",
     "finite_real",
+    "TrackStep",
+    "InverseTracker",
+    "track_points",
+    "ANCHORED",
+    "OK",
+    "AMBIGUOUS",
+    "NO_CANDIDATE",
+    "STEP_TOO_LARGE",
+    "ANCHOR_REJECTED",
+    "BROKEN_NEEDS_ANCHOR",
 ]

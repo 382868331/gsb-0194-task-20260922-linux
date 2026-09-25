@@ -96,6 +96,12 @@ class DistortionModel:
         return [undistort_points(self, tx, ty, R, **kwargs)
                 for (tx, ty) in cleaned]
 
+    def track(self, targets, anchor, R, **kwargs):
+        """Continuous-branch tracking; see
+        :func:`distortion.tracking.track_points`."""
+        from .tracking import track_points
+        return track_points(self, targets, anchor, R, **kwargs)
+
     def _distort(self, x, y):
         r2 = x * x + y * y
         radial = 1.0 + (self.k1 + self.k2 * r2) * r2

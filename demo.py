@@ -7,15 +7,27 @@ Runs real computation (no sleep, no pre-recorded results) and prints:
      with its forward residual, plus the radial uniqueness certificate,
   3. the same fold with a small tangential term solved by multi-start
      damped Newton,
-  4. a proven no-solution case, and
-  5. actually triggered input rejections.
+  4. a proven no-solution case,
+  5. continuous-branch tracking (candidates per frame, selected root,
+     an ambiguous tie and track breaks), and
+  6. actually triggered input rejections.
 
-Run:  python demo.py     (completes in well under 8 seconds)
+Run:  python demo.py     (completes in well under 90 seconds)
 """
 
 import time
 
-from distortion import DistortionModel
+from distortion import (
+    DistortionModel,
+    track_points,
+    ANCHORED,
+    OK,
+    AMBIGUOUS,
+    NO_CANDIDATE,
+    STEP_TOO_LARGE,
+    ANCHOR_REJECTED,
+    BROKEN_NEEDS_ANCHOR,
+)
 
 
 def banner(title):
@@ -87,7 +99,77 @@ def main():
     print(f"  undistort({far_x}, 0, R=1) with the identity model:")
     show_result(identity, result3)
 
-    banner("5. Actually triggered rejection / exception boundaries")
+    banner("5. Continuous-branch tracking over a folding radial map")
+    track_model = DistortionModel(k1=-0.8, k2=0.1)
+
+    def g(r):
+        return r * (1.0 - 0.8 * r * r + 0.1 * r ** 4)
+
+    def show_steps(title, steps):
+        print(f"  {title}")
+        for st in steps:
+            xp, yp = st.target
+            head = (f"    frame {st.index}: target=({xp: .9f}, {yp: .9f}) "
+                    f"-> {st.status}")
+            print(head)
+            for j, (c, d) in enumerate(zip(st.candidates, st.distances)):
+                mark = ""
+                if st.status == OK and c is st.selected:
+                    mark = "  <== selected (nearest, within max_step)"
+                elif c in st.tied:
+                    mark = "  <== tied nearest (ambiguous, retained)"
+                print(f"        cand[{j}] (x={c.x: .10f}, y={c.y: .3g}) "
+                      f"resid={c.residual:.2e} step={d:.6f}{mark}")
+            if st.previous is not None and not st.distances:
+                print("        no residual-accepted candidates")
+            if st.status == ANCHORED and st.selected is not None:
+                print(f"        anchor forward residual = "
+                      f"{st.selected.residual:.3e}")
+            print(f"        reason: {st.reason}")
+
+    # 5a. Unique branch: the source path stays on the inner fold branch.
+    sources = [0.30, 0.38, 0.46, 0.54]
+    targets = [(g(r), 0.0) for r in sources]
+    steps_ok = track_points(track_model, targets, (sources[0], 0.0),
+                            R=3.0, max_step=0.2)
+    show_steps("5a. unique branch: several candidates per frame, the "
+               "tracked one follows the source", steps_ok)
+
+    # 5b. Near a fold: ambiguous equidistant pair breaks the track.
+    rc = 0.6789168263001503
+    s_near = g(rc - 0.10)
+    r = track_model.undistort(s_near, 0.0, R=3.0)
+    inner = sorted(c.x for c in r.candidates
+                   if abs(abs(c.x) - rc) < 0.2)
+    mid = 0.5 * (inner[0] + inner[1])
+    steps_tie = track_points(track_model, [(g(mid), 0.0), (s_near, 0.0)],
+                             (mid, 0.0), R=3.0, max_step=0.5,
+                             equal_tol=1e-9)
+    show_steps("5b. equidistant roots: ambiguous, neither root picked "
+               "by list order", steps_tie)
+
+    # 5c. Mid-track breaks: step exceeds the limit; later frames need a
+    # new anchor; then a certified no-candidate break.
+    steps_break = track_points(
+        track_model,
+        [(g(0.45), 0.0), (g(0.62), 0.0), (g(0.60), 0.0)],
+        (0.45, 0.0), R=3.0, max_step=0.02)
+    show_steps("5c. step_too_large breaks the track; following frame "
+               "needs a new anchor", steps_break)
+    steps_gap = track_points(DistortionModel(),
+                             [(0.5, 0.0), (1.5, 0.0), (0.6, 0.0)],
+                             (0.5, 0.0), R=1.0, max_step=0.5)
+    show_steps("5d. no_candidate: target outside the box (certified)",
+               steps_gap)
+
+    # 5e. A wrong anchor is rejected by forward verification.
+    steps_bad_anchor = track_points(
+        track_model, [(g(0.60), 0.0)], (0.50, 0.0), R=3.0,
+        max_step=0.1)
+    show_steps("5e. wrong anchor: forward check fails, no track started",
+               steps_bad_anchor)
+
+    banner("6. Actually triggered rejection / exception boundaries")
     demonstrations = []
 
     def attempt(label, fn):
@@ -115,7 +197,7 @@ def main():
     print("  ever partially built.")
 
     elapsed = time.perf_counter() - t0
-    banner(f"done in {elapsed:.3f} s (budget ~ 8 s)")
+    banner(f"done in {elapsed:.3f} s (budget 90 s)")
 
 
 if __name__ == "__main__":

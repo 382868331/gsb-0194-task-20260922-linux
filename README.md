@@ -13,8 +13,8 @@
 准确命令（在仓库根目录执行）：
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（约 0.5 秒）
-python demo.py                            # 固定输入演示（实测 < 1 秒，预算约 8 秒）
+./.venv/bin/python -m unittest discover -s tests -v   # 全部测试（30 个，约 1 秒）
+./.venv/bin/python demo.py                            # 固定输入演示（实测 < 1 秒，预算 90 秒）
 ```
 
 ## 数学模型（本题契约的精确子集）
@@ -62,6 +62,54 @@ results = m.undistort_all([(xp, yp), ...], R, **同上)
 `Candidate` 字段：`x, y, residual, method`；`method` 为
 `"radial_certified"` 或 `"damped_newton"`；`residual =
 ‖distort(x,y) − (xp,yp)‖₂`。候选可解包为 `(x, y)`。
+
+### 连续分支跟踪入口（不取首根）
+
+多根时每帧独立取 `candidates[0]` 会在分支间乱跳。新增跟踪入口：调用方
+给出一串**畸变后坐标** `targets` 和第一个点的**未畸变锚点** `anchor`；
+每一步仍先由原求解器（径向证书路径或多起点 Newton）生成残差合格候选，
+再在候选中选择**距上一被选结果最近**且不超过显式步长上限 `max_step`
+的根。
+
+```python
+from distortion import track_points, InverseTracker
+
+steps = track_points(
+    m,
+    [(xp0, yp0), (xp1, yp1), ...],   # 1..100 个畸变后坐标
+    (x0, y0),                        # 第一个点的未畸变锚点
+    R,
+    max_step=0.2,        # 相邻被选根在未畸变空间的硬步长上限（>0）
+    equal_tol=1e-9,      # 同距容差：|d1-d2| <= equal_tol*max(1,d_min) 即同距
+    anchor_tol=1e-7,     # 锚点正向校验残差上限
+    residual_tol=1e-10,  # 以下参数原样转发给原逆解器
+    starts_per_axis=5, max_iterations=80,
+)
+# 状态式用法：tracker = InverseTracker(m, R, max_step=...)
+# step0 = tracker.start(xp0, yp0, x0, y0); step = tracker.update(i, xp, yp)
+# 断开后必须重新 start(...) 提供新锚点；m.track(...) 为同名便捷方法
+```
+
+每帧返回一个 `TrackStep`（`index/target/status/selected/previous/
+candidates/distances/tied/reason/result`）。`result` 是原 `InverseResult`，
+因此原求根的**完备性限制与径向特例证书原样保留**——连续分支选择只是
+跟踪启发式，**不证明逆函数唯一**。状态取值与语义：
+
+| 状态 | 语义 |
+|---|---|
+| `anchored` | 第 0 帧：锚点通过正向校验，轨迹建立 |
+| `ok` | 唯一最近根被选中，步长 ≤ `max_step` |
+| `ambiguous` | 两个及以上可行候选在 `equal_tol` 内同距：**不按列表顺序偷选**，`tied`/`candidates` 全部保留，轨迹断开 |
+| `no_candidate` | 原求解器无残差合格候选（可能带径向无解证书或 Newton 预算标志），轨迹断开 |
+| `step_too_large` | 最近候选也超过 `max_step`，轨迹断开（不静默跳到另一折叠分支） |
+| `anchor_rejected` | 锚点不在盒内，或 `distort(anchor)` 与首目标残差 > `anchor_tol` |
+| `broken_needs_anchor` | 前一帧已断开；本帧不选根，必须用新锚点重新开始 |
+
+**锚点必须正向校验**：锚点落在 `[-R,R]²` 内且其正向重投影与第一个畸变
+目标一致（残差 ≤ `anchor_tol`）才接受；否则返回 `anchor_rejected`，不
+建立轨迹（求解器候选仍保留在该帧以便诊断）。断开后除重新 `start` 外，
+后续 `update` 一律返回 `broken_needs_anchor`，`track_points` 中后续帧同
+理。跟踪同样受 100 点上限与有限实数/真整数校验约束。
 
 ### 输入上限与错误语义
 
@@ -169,6 +217,10 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
 6. 只实现本题公式的 4 系数模型；不做相机标定、畸变系数约定转换或
    行业标准兼容性声明。
 7. 批量上限 100 是接口边界而非性能建议；演示用例不穷举该规模。
+8. 连续分支跟踪用“距上一结果最近”在折叠映射上选取分支，是启发式而非
+   逆函数唯一性证明；其候选集仍继承上述全部求根完备性限制。折返点
+   附近真实分支会合并/消失，此时应表现为 `step_too_large`、
+   `ambiguous` 或 `no_candidate` 断开，而不是由跟踪器强行续接。
 
 ## 仓库结构
 
@@ -178,11 +230,16 @@ distortion/numeric.py     # 有限实数/整数校验
 distortion/model.py       # 前向模型、解析 Jacobian、批量接口
 distortion/radial.py      # 纯径向分段单调性证书求解
 distortion/inverse.py     # 结果类型、多起点阻尼 Newton、统一入口
+distortion/tracking.py    # 连续分支跟踪：锚点校验、最近根、同距歧义、断点
 tests/test_distortion.py  # 独立参考 + 20 个测试
+tests/test_tracking.py    # 跟踪 5 类场景 + 校验（独立高精度分段找根核对）
 demo.py                   # 固定输入演示
 README.md
 ```
 
 测试中的期望值全部独立得到（手算解析例、独立临界点二次方程、稠密
 符号变化扫描、中心有限差分 Jacobian）；被测核心不用于生成期望值，
-distort↔undistort 往返仅作补充断言。
+distort↔undistort 往返仅作补充断言。跟踪测试额外用**本文件内独立编写的
+高精度一维分段找根器**（稠密符号变化扫描 + 每交点 300 次二分、临界点
+切根单独处理）核对每帧被选根属于独立根集；覆盖：唯一分支、靠近折返点、
+两根同距（含逆序候选不改变结果）、错误锚点、中途断点（超步长与无候选）。
