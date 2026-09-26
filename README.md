@@ -13,8 +13,18 @@
 准确命令（在仓库根目录执行）：
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（约 0.5 秒）
+python -m unittest discover -s tests -v   # 必要测试（约 1.5 秒）
 python demo.py                            # 固定输入演示（实测 < 1 秒，预算约 8 秒）
+python demo_iteration.py                  # 前向重采样演示（实测 < 2 秒，上限 90 秒）
+```
+
+隔离 venv 准备（可选；本项目无第三方依赖，venv 仅用于隔离解释器）：
+
+```bash
+python -m venv .venv          # 创建隔离环境
+. .venv/bin/activate          # 激活后以下命令均在隔离环境内执行
+python -m unittest discover -s tests -v
+python demo_iteration.py
 ```
 
 ## 数学模型（本题契约的精确子集）
@@ -31,7 +41,8 @@ r² = x² + y²
 ## 公开接口
 
 ```python
-from distortion import DistortionModel, Candidate, InverseResult, finite_real
+from distortion import (DistortionModel, Candidate, InverseResult, finite_real,
+                        forward_resample, exact_quad_resample, ResampleResult)
 
 m = DistortionModel(k1=0.0, k2=0.0, p1=0.0, p2=0.0)
 
@@ -77,6 +88,48 @@ results = m.undistort_all([(xp, yp), ...], R, **同上)
   模型本身无状态，不存在未说明的部分变更。
 - **搜索预算耗尽与证明无解严格分开**：通用 Newton 路径永不置
   `proven_no_solution`；证书无解只可能来自径向分段路径。
+
+## 前向重采样（按像素面积分配亮度）
+
+把小灰度图的每个源像素当作**有面积的常值单元**（单位正方形），经现有
+畸变前向映射分配到目标格子。输出每格收到的**能量**（值×面积）与
+**覆盖面积**两个独立网格——不是点采样后再补归一因子：每片叶子的面积
+都在目标平面上由映射后的多边形直接量出。
+
+```python
+res = forward_resample(
+    model,                # DistortionModel
+    image,                # list[list[float]]，image[r][c] 为常值像素
+    window=(x0, y0, w, h),# 目标窗（归一化平面）
+    shape=(rows, cols),   # 目标网格
+    origin=(ox, oy),      # 像素 (r,c) 覆盖 [ox+c,ox+c+1]x[oy+r,oy+r+1]
+    area_tol=1e-6,        # 叶子接受容差（目标平面面积单位）
+    max_depth=8,          # 四叉树最大深度
+    max_leaves=200000)    # 细分节点预算
+```
+
+`ResampleResult` 字段：`energy`、`area`（rows×cols 网格）、
+`lost_energy`（质心落出目标窗的能量，绝不悄悄并回窗内）、
+`input_energy`、`error_estimate`（各叶子 |四角四边形面积 −
+加密八边形面积| 的累计，是误差**指标**而非严格界）、`converged`
+（预算耗尽时为 `False`，此时不声称容差或严格守恒已达标）、
+`leaves_used`。
+
+适用范围与边界：
+
+- **只在调用方已验证的单值区域工作**：要求映射在源区域内不把像素
+  折叠到自交（可用 `undistort` 的可逆性检查先行验证）；折叠区
+  内面积按有向多边形绝对值累计，不保证物理意义。
+- 自适应细分用四叉树近似弯曲像素边界；叶子按映射后八边形的**质心**
+  落入单个目标格（splat），因此单格能量存在 O(叶尺寸) 的离散下限，
+  总量指标（`error_estimate`、与更密独立运行的偏差）才是收敛
+  判据。
+- 恒等/仿射退化情形可用 `exact_quad_resample(quads, values, window,
+  shape` 作精确参考：Sutherland–Hodgman 多边形裁剪给出每格精确
+  面积，无细分、无容差。
+- 接口上限：图像边长 ≤ 64，目标格数 ≤ 4096；目标格面积 <
+  `MIN_CELL_AREA`（1e-12）直接拒绝（面积接近零的拒绝）；所有
+  数值输入拒绝 NaN/±Inf，整数参数拒绝 bool，与基线错误语义一致。
 
 ## 算法与设计取舍
 
@@ -169,6 +222,9 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
 6. 只实现本题公式的 4 系数模型；不做相机标定、畸变系数约定转换或
    行业标准兼容性声明。
 7. 批量上限 100 是接口边界而非性能建议；演示用例不穷举该规模。
+8. 前向重采样的 `error_estimate` 是细分误差**指标**而非严格
+   守恒界；`converged=False` 时结果仍返回但明确不作达标声明。
+   质心 splat 使单格能量有离散下限，单格精度需以更密独立运行对照。
 
 ## 仓库结构
 
@@ -178,8 +234,11 @@ distortion/numeric.py     # 有限实数/整数校验
 distortion/model.py       # 前向模型、解析 Jacobian、批量接口
 distortion/radial.py      # 纯径向分段单调性证书求解
 distortion/inverse.py     # 结果类型、多起点阻尼 Newton、统一入口
-tests/test_distortion.py  # 独立参考 + 20 个测试
-demo.py                   # 固定输入演示
+distortion/resample.py    # 前向面积重采样 + 精确多边形裁剪参考
+tests/test_distortion.py  # 基线：独立参考 + 20 个测试
+tests/test_resample.py    # 重采样：精确裁剪对照、收敛、出窗、拒绝
+demo.py                   # 固定输入演示（逆解）
+demo_iteration.py         # 前向重采样离线演示
 README.md
 ```
 
