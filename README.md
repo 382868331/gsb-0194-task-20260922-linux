@@ -13,9 +13,12 @@
 准确命令（在仓库根目录执行）：
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（约 0.5 秒）
-python demo.py                            # 固定输入演示（实测 < 1 秒，预算约 8 秒）
+python -m unittest discover -s tests -v   # 全部测试（基线回归 + 前向重采样，约 3 秒）
+python demo.py                            # 逆解演示（实测 < 1 秒）
+python demo_iteration.py                  # 前向重采样演示（实测 < 1 秒，预算 90 秒）
 ```
+
+如使用隔离环境：python3 -m venv .venv && . .venv/bin/activate 即可；无第三方依赖，激活后上述命令不变。
 
 ## 数学模型（本题契约的精确子集）
 
@@ -77,6 +80,29 @@ results = m.undistort_all([(xp, yp), ...], R, **同上)
   模型本身无状态，不存在未说明的部分变更。
 - **搜索预算耗尽与证明无解严格分开**：通用 Newton 路径永不置
   `proven_no_solution`；证书无解只可能来自径向分段路径。
+
+## 前向面积重采样（小灰度图）
+
+forward_resample 把源像素视为**有面积的常值单元**，经畸变映射前向分配到目标格子；每个目标格输出**收到的能量**与**覆盖面积**两个独立网格——不做点采样，也不做事后归一因子。
+
+调用：forward_resample(model, pixels, src_extent, dst_extent, dst_shape, tol=1e-6, max_depth=12, max_quads=200000)。pixels 为行列表（首行在上，<= 64x64，有限实数灰度）；src_extent/dst_extent 为 (x0, x1, y0, y1)；dst_shape 为 (行, 列)，各 <= 512。
+
+ForwardResult 字段：energy / area（目标网格，分开输出）、lost_energy / lost_area（映射到目标窗外的部分，**不**重新分配）、total_energy（源侧 值x像素面积 之和）、subdivision_error（所有叶子实际接受的最大边界偏差）、budget_exhausted、quads_used、certificate。
+
+### 方法
+
+- 每个源像素是源平面上的矩形常值单元；四角经 distort 映射。
+- **自适应四叉细分**：比较边中点/中心的真实映射与角点双线性插值的偏差，超过 tol 则四分；该偏差即弯曲像素边界的近似误差指标。
+- 每个叶子四边形用 **Sutherland-Hodgman 精确多边形裁剪**对目标窗和每个重叠目标格求交面积；能量 = 值 x 精确交面积。恒等/仿射（全零系数）退化情形无需细分，结果与精确多边形裁剪参考逐格一致（测试中有独立重写的裁剪器核对）。
+- **适用范围**：只在调用方已验证的**单值区域**工作（映射不折叠）；折叠区域上有符号面积会相互抵消，本接口不检测也不声称处理该情形。
+- **预算语义**：max_quads 或 max_depth 耗尽时照常返回部分结果并置 budget_exhausted=True，此时**不声称**细分误差已满足 tol；certificate 文本明确说明。
+- **拒绝语义**：源像素面积 < 1e-24（近零退化）抛 ValueError；NaN/Inf、bool、ragged 行、空图、非法 extent/shape 均按既有错误语义拒绝；全部校验先于任何计算。
+
+### 误差口径（前向）
+
+- 叶子内部：交面积精确到裁剪器舍入（约 1e-15 量级）。
+- 弯曲边界：由 subdivision_error 如实报告，收敛时 <= tol；能量账 sum(energy) + lost_energy 收敛于独立稠密积分 值x|det J|（测试用独立有限差分 Jacobian 的稠密中点积分核对到 2e-3 以内，实测约 2e-5）。
+- 恒等映射下 sum(energy) + lost_energy == total_energy 到 1e-12。
 
 ## 算法与设计取舍
 
@@ -169,6 +195,7 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
 6. 只实现本题公式的 4 系数模型；不做相机标定、畸变系数约定转换或
    行业标准兼容性声明。
 7. 批量上限 100 是接口边界而非性能建议；演示用例不穷举该规模。
+8. 前向重采样假定单值（无折叠）区域；折叠区域的面积账不正确且不报警。目标窗与源区域均为轴对齐矩形；不依赖任何图像库或界面。
 
 ## 仓库结构
 
@@ -178,8 +205,12 @@ distortion/numeric.py     # 有限实数/整数校验
 distortion/model.py       # 前向模型、解析 Jacobian、批量接口
 distortion/radial.py      # 纯径向分段单调性证书求解
 distortion/inverse.py     # 结果类型、多起点阻尼 Newton、统一入口
-tests/test_distortion.py  # 独立参考 + 20 个测试
-demo.py                   # 固定输入演示
+distortion/clip.py        # Sutherland-Hodgman 裁剪与 shoelace 面积
+distortion/forward.py     # 前向面积重采样（自适应细分 + 精确裁剪分配）
+tests/test_distortion.py  # 基线回归：独立参考 + 20 个测试
+tests/test_forward.py     # 前向重采样：独立裁剪/稠密积分参考 + 13 个测试
+demo.py                   # 逆解固定输入演示
+demo_iteration.py         # 前向重采样离线演示（< 90 秒）
 README.md
 ```
 
