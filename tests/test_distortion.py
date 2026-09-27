@@ -398,3 +398,159 @@ class TestValidation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Trajectory mode
+# ---------------------------------------------------------------------------
+
+class TestTrajectory(unittest.TestCase):
+    K1, K2, R = -0.8, 0.1, 3.0
+
+    def test_identity_trajectory_complete(self):
+        m = DistortionModel()
+        targets = [(0.1 * i, 0.05 * i) for i in range(1, 8)]
+        first = m.undistort(*targets[0], R=1.0)
+        traj = m.undistort_trajectory(targets, 1.0, first.candidates[0],
+                                      max_step=0.5)
+        self.assertTrue(traj.complete)
+        self.assertIsNone(traj.stop_reason)
+        self.assertEqual(len(traj.steps), len(targets))
+        self.assertEqual(traj.steps[0].status, "start")
+        for step, (tx, ty) in zip(traj.steps, targets):
+            self.assertIn(step.status, ("start", "continued"))
+            self.assertAlmostEqual(step.candidate.x, tx, delta=1e-9)
+            self.assertAlmostEqual(step.candidate.y, ty, delta=1e-9)
+            self.assertLessEqual(step.candidate.residual, 1e-10)
+        self.assertEqual(len(traj.points), len(targets))
+
+    def test_start_must_match_a_candidate(self):
+        m = DistortionModel()
+        targets = [(0.2, 0.0), (0.3, 0.0)]
+        with self.assertRaises(ValueError) as ctx:
+            m.undistort_trajectory(targets, 1.0, (0.9, 0.9), max_step=0.5)
+        self.assertIn("start", str(ctx.exception))
+        # ... while the genuine candidate is accepted
+        first = m.undistort(*targets[0], R=1.0)
+        traj = m.undistort_trajectory(targets, 1.0, first.candidates[0],
+                                      max_step=0.5)
+        self.assertTrue(traj.complete)
+
+    def test_branch_disappearance_interrupts(self):
+        # g(r) = r(1 - 0.8 r^2 + 0.1 r^4) has a local max ~0.443 at
+        # r ~ 0.679; the small-radius branch of g(r) = s provably ends
+        # when s grows past that fold.
+        m = DistortionModel(k1=self.K1, k2=self.K2)
+        targets = [(s, 0.0) for s in
+                   (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50)]
+        first = m.undistort(*targets[0], R=self.R)
+        # anchor on the SMALLEST-radius candidate (the branch that folds)
+        anchor = min(first.candidates, key=lambda c: abs(c.x))
+        self.assertLess(abs(anchor.x), 0.5)
+
+        traj = m.undistort_trajectory(targets, self.R, anchor,
+                                      max_step=0.2)
+        self.assertFalse(traj.complete)
+        self.assertIsNotNone(traj.stop_reason)
+        last = traj.steps[-1]
+        self.assertEqual(last.status, "branch_changed")
+        self.assertGreater(last.distance, 0.2)
+        # every step before the break stayed on the tracked branch
+        for step in traj.steps[:-1]:
+            self.assertIn(step.status, ("start", "continued"))
+            self.assertLess(abs(step.candidate.x), 0.8)
+        # the reported jump target is still a validated candidate
+        self.assertLessEqual(last.candidate.residual, 1e-10)
+
+    def test_follow_jumps_flags_but_continues(self):
+        m = DistortionModel(k1=self.K1, k2=self.K2)
+        targets = [(s, 0.0) for s in
+                   (0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50)]
+        first = m.undistort(*targets[0], R=self.R)
+        anchor = min(first.candidates, key=lambda c: abs(c.x))
+        traj = m.undistort_trajectory(targets, self.R, anchor,
+                                      max_step=0.2, follow_jumps=True)
+        self.assertTrue(traj.complete)
+        statuses = [s.status for s in traj.steps]
+        self.assertIn("branch_changed", statuses)
+        # the jump is flagged, never relabelled as continuous
+        for step in traj.steps:
+            if step.status == "branch_changed":
+                self.assertGreater(step.distance, 0.2)
+            else:
+                self.assertIn(step.status, ("start", "continued"))
+
+    def test_no_candidate_is_not_called_proven(self):
+        # general (tangential) path: empty search result, no certificate
+        m = DistortionModel(k1=-0.1, p1=0.01)
+        targets = [(0.1, 0.0), (50.0, 0.0)]  # second target unreachable
+        first = m.undistort(*targets[0], R=1.0)
+        traj = m.undistort_trajectory(targets, 1.0, first.candidates[0],
+                                      max_step=0.5)
+        self.assertFalse(traj.complete)
+        last = traj.steps[-1]
+        self.assertEqual(last.status, "no_candidate")
+        self.assertIsNone(last.candidate)
+        self.assertFalse(last.result.proven_no_solution)
+        self.assertIn("NOT a proof", traj.stop_reason)
+
+    def test_proven_no_solution_reported_as_such(self):
+        m = DistortionModel()  # identity is radial -> certificate path
+        targets = [(0.5, 0.0), (1.5, 0.0)]  # 1.5 outside [-1, 1]
+        first = m.undistort(*targets[0], R=1.0)
+        traj = m.undistort_trajectory(targets, 1.0, first.candidates[0],
+                                      max_step=0.5)
+        self.assertFalse(traj.complete)
+        last = traj.steps[-1]
+        self.assertEqual(last.status, "no_candidate")
+        self.assertTrue(last.result.proven_no_solution)
+        self.assertIn("PROVES", traj.stop_reason)
+
+    def test_tracks_same_branch_when_several_exist(self):
+        # several preimages per target; the tracker must stay near the
+        # previously tracked point instead of hopping between roots
+        m = DistortionModel(k1=self.K1, k2=self.K2)
+        targets = [(0.30 + 0.01 * i, 0.0) for i in range(6)]
+        first = m.undistort(*targets[0], R=self.R)
+        self.assertGreaterEqual(len(first.candidates), 2)
+        anchor = max(first.candidates, key=lambda c: abs(c.x))
+        traj = m.undistort_trajectory(targets, self.R, anchor,
+                                      max_step=0.1)
+        self.assertTrue(traj.complete)
+        for step in traj.steps[1:]:
+            self.assertEqual(step.status, "continued")
+            self.assertLessEqual(step.distance, 0.1)
+            self.assertLessEqual(step.candidate.residual, 1e-10)
+        # tracked radius stays on the large-radius branch throughout
+        for step in traj.steps:
+            self.assertGreater(abs(step.candidate.x), 1.0)
+
+    def test_validation_and_atomicity(self):
+        m = DistortionModel()
+        good = [(0.1, 0.0), (0.2, 0.0)]
+        with self.assertRaises(ValueError):
+            m.undistort_trajectory([], 1.0, (0.0, 0.0), max_step=0.5)
+        with self.assertRaises(ValueError):
+            m.undistort_trajectory([(0.0, 0.0)] * 101, 1.0, (0.0, 0.0),
+                                   max_step=0.5)
+        with self.assertRaises(ValueError):
+            m.undistort_trajectory(good, 1.0, (0.1, 0.0), max_step=0.0)
+        with self.assertRaises(ValueError):
+            m.undistort_trajectory(good, 1.0, (0.1, 0.0),
+                                   max_step=float("nan"))
+        with self.assertRaises(TypeError):
+            m.undistort_trajectory(good, 1.0, (0.1, 0.0), max_step=True)
+        with self.assertRaises(TypeError):
+            m.undistort_trajectory(good, 1.0, "nowhere", max_step=0.5)
+        with self.assertRaises(ValueError):
+            m.undistort_trajectory([(float("nan"), 0.0)], 1.0, (0.0, 0.0),
+                                   max_step=0.5)
+        with self.assertRaises(TypeError):
+            m.undistort_trajectory(good, 1.0, (0.1, 0.0), max_step=0.5,
+                                   starts_per_axis=True)
+        with self.assertRaises(ValueError):
+            m.undistort_trajectory(good, 0.0, (0.1, 0.0), max_step=0.5)
+        with self.assertRaises(TypeError):
+            m.undistort_trajectory(good, 1.0, (0.1, 0.0), max_step=0.5,
+                                   follow_jumps=1)
+

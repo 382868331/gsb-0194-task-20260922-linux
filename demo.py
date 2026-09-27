@@ -87,7 +87,31 @@ def main():
     print(f"  undistort({far_x}, 0, R=1) with the identity model:")
     show_result(identity, result3)
 
-    banner("5. Actually triggered rejection / exception boundaries")
+    banner("5. Trajectory mode: follow ONE branch, stop when it ends")
+    # Same folding radial model; the small-radius branch of g(r) = s
+    # provably ends at the fold (local max of g is ~0.443).
+    traj_targets = [(0.20 + 0.05 * i, 0.0) for i in range(7)]
+    first = radial_model.undistort(*traj_targets[0], R=3.0)
+    anchor = min(first.candidates, key=lambda c: abs(c.x))
+    print(f"  targets: s = 0.20 .. 0.50 on the x-axis, R = 3")
+    print(f"  caller-chosen start: the small-radius candidate "
+          f"({anchor.x:.6f}, {anchor.y:.1f})")
+    traj = radial_model.undistort_trajectory(traj_targets, 3.0, anchor,
+                                             max_step=0.2)
+    for step in traj:
+        if step.candidate is not None:
+            where = f"({step.candidate.x: .6f}, {step.candidate.y: .1f})"
+        else:
+            where = "(no candidate)"
+        dist = "     --" if step.distance is None else f"{step.distance:7.4f}"
+        print(f"    step {step.index}: target s={step.xp:.2f}  "
+              f"status={step.status:<14s} step={dist}  point={where}")
+    print(f"  complete: {traj.complete}")
+    print(f"  stop reason: {traj.stop_reason}")
+    print("  the tracker never hops to another branch silently: the jump")
+    print("  is reported as 'branch_changed' and the trajectory stops.")
+
+    banner("6. Actually triggered rejection / exception boundaries")
     demonstrations = []
 
     def attempt(label, fn):

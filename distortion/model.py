@@ -96,6 +96,19 @@ class DistortionModel:
         return [undistort_points(self, tx, ty, R, **kwargs)
                 for (tx, ty) in cleaned]
 
+    def undistort_trajectory(self, targets, R, start, **kwargs):
+        """Track one inverse branch across a sequence of targets.
+
+        See distortion.trajectory.undistort_trajectory.  The caller
+        picks ``start`` from the accepted candidates of the first
+        target; every later step is still a fully residual-checked
+        single-point inverse, and a disappeared branch interrupts the
+        trajectory (or is flagged 'branch_changed' with
+        follow_jumps=True) instead of being silently swapped.
+        """
+        from .trajectory import undistort_trajectory
+        return undistort_trajectory(self, targets, R, start, **kwargs)
+
     def _distort(self, x, y):
         r2 = x * x + y * y
         radial = 1.0 + (self.k1 + self.k2 * r2) * r2

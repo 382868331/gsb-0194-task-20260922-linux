@@ -13,11 +13,14 @@ model compatibility.
 
 from .model import DistortionModel
 from .inverse import Candidate, InverseResult
+from .trajectory import TrajectoryStep, TrajectoryResult
 from .numeric import finite_real
 
 __all__ = [
     "DistortionModel",
     "Candidate",
     "InverseResult",
+    "TrajectoryStep",
+    "TrajectoryResult",
     "finite_real",
 ]

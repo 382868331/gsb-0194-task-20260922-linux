@@ -47,6 +47,34 @@ res: InverseResult = m.undistort(xp, yp, R,
 results = m.undistort_all([(xp, yp), ...], R, **同上)
 ```
 
+轨迹模式（在单点逆解之上跟踪同一解分支）：
+
+```python
+first = m.undistort(xp0, yp0, R)          # 调用方先从首目标候选中选起点
+traj = m.undistort_trajectory(targets, R, first.candidates[0],
+                              max_step=0.2,        # 相邻跟踪点最大允许距离
+                              follow_jumps=False,  # 分支消失时中断(默认)
+                              **单点求解参数)
+```
+
+`TrajectoryResult` 字段：`steps`（每步一个 `TrajectoryStep`）、`complete`
+（是否无中断跟踪完全部目标）、`stop_reason`（中断原因，完成时为 `None`）。
+`TrajectoryStep` 字段：`index`、`xp/yp`、`result`（该步完整的单点
+`InverseResult`）、`candidate`（被跟踪的候选，分支丢失时为 `None`）、
+`distance`（与上一跟踪点的距离）、`status`：
+
+| status | 含义 |
+|---|---|
+| `start` | 首步，调用方选择的锚点候选（已对照首目标候选集验证） |
+| `continued` | 最近候选在 `max_step` 内，分支延续 |
+| `branch_changed` | 最近候选超出 `max_step`，被跟踪的分支消失；默认在此中断，`follow_jumps=True` 时显式换支但该步保持标记，绝不伪装成连续 |
+| `no_candidate` | 该步单点搜索没有任何候选；仅当径向证书路径置 `proven_no_solution` 时才算证明无解，否则只表示"本次搜索未找到" |
+
+轨迹模式逐步仍调用完整单点逆解，每个报告点都是经残差检验的候选；
+起点必须匹配首目标的某个已接受候选（默认容差 `1e-6*max(1,R)`，可用
+`start_match_tol` 调整），否则抛 `ValueError`。目标序列 1..100 点，
+全部参数先校验后求解，拒绝的调用不会留下部分计算的步骤。
+
 `InverseResult` 字段：
 
 | 字段 | 含义 |
@@ -169,6 +197,10 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
 6. 只实现本题公式的 4 系数模型；不做相机标定、畸变系数约定转换或
    行业标准兼容性声明。
 7. 批量上限 100 是接口边界而非性能建议；演示用例不穷举该规模。
+8. 轨迹模式的"同一分支"由调用方给的 `max_step` 距离阈值定义：两个
+   相距超过该阈值的合法候选被视为不同分支。阈值过大会把跳支误判为
+   连续，过小会把正常快速运动误判为分支消失；库不替调用方选择该
+   物理尺度。
 
 ## 仓库结构
 
@@ -178,7 +210,8 @@ distortion/numeric.py     # 有限实数/整数校验
 distortion/model.py       # 前向模型、解析 Jacobian、批量接口
 distortion/radial.py      # 纯径向分段单调性证书求解
 distortion/inverse.py     # 结果类型、多起点阻尼 Newton、统一入口
-tests/test_distortion.py  # 独立参考 + 20 个测试
+distortion/trajectory.py  # 轨迹模式：跨目标跟踪同一解分支
+tests/test_distortion.py  # 独立参考 + 29 个测试
 demo.py                   # 固定输入演示
 README.md
 ```
