@@ -20,7 +20,14 @@ import math
 from .numeric import finite_real, finite_real_pair, checked_int
 from .radial import radial_invert
 
-__all__ = ["Candidate", "InverseResult", "undistort_points"]
+__all__ = [
+    "Candidate",
+    "InverseResult",
+    "TrajectoryPoint",
+    "TrajectoryResult",
+    "undistort_points",
+    "undistort_trajectory",
+]
 
 
 class Candidate:
@@ -102,6 +109,100 @@ class InverseResult:
                 f"n={len(self.candidates)}, unique={self.unique}, "
                 f"proven_no_solution={self.proven_no_solution}, "
                 f"budget_exhausted={self.budget_exhausted})")
+
+
+class TrajectoryPoint:
+    """One target in a branch-tracked trajectory.
+
+    Attributes:
+        index     -- zero-based position in the target sequence
+        xp, yp    -- requested distorted target
+        result    -- complete ordinary single-point inverse result
+        candidate -- verified candidate on the tracked branch, or ``None``
+                     when tracking was interrupted at this target
+        status    -- ``"started"``, ``"tracking"`` or ``"interrupted"``
+        reason    -- machine-readable explanation code
+        message   -- human-readable explanation
+    """
+
+    __slots__ = ("index", "xp", "yp", "result", "candidate",
+                 "status", "reason", "message")
+
+    def __init__(self, index, xp, yp, result, candidate, status, reason,
+                 message):
+        self.index = index
+        self.xp = xp
+        self.yp = yp
+        self.result = result
+        self.candidate = candidate
+        self.status = status
+        self.reason = reason
+        self.message = message
+
+    @property
+    def tracking(self):
+        """True when this point has a candidate on the tracked branch."""
+        return self.candidate is not None
+
+    def __iter__(self):
+        if self.candidate is None:
+            raise TypeError(
+                "an interrupted TrajectoryPoint has no (x, y) candidate"
+            )
+        yield self.candidate.x
+        yield self.candidate.y
+
+    def __repr__(self):
+        return (f"TrajectoryPoint(index={self.index}, "
+                f"target=({self.xp!r},{self.yp!r}), status={self.status!r}, "
+                f"reason={self.reason!r})")
+
+
+class TrajectoryResult:
+    """Result of tracking one explicitly selected inverse branch.
+
+    Trajectory processing stops at the first target where the selected
+    branch cannot be continued and verified.  The ordinary search result
+    at that target remains available, but another candidate is never
+    silently selected.
+    """
+
+    __slots__ = ("R", "residual_tol", "points", "active",
+                 "interrupted", "interruption")
+
+    def __init__(self, R, residual_tol, points):
+        self.R = R
+        self.residual_tol = residual_tol
+        self.points = points
+        self.interruption = next((p for p in points
+                                  if p.status == "interrupted"), None)
+        self.interrupted = self.interruption is not None
+        self.active = not self.interrupted
+
+    def __len__(self):
+        return len(self.points)
+
+    def __iter__(self):
+        return iter(self.points)
+
+    @property
+    def candidates(self):
+        """Verified tracked candidates, in trajectory order."""
+        return [p.candidate for p in self.points if p.candidate is not None]
+
+    @property
+    def points_xy(self):
+        """Tracked ``(x, y)`` pairs; raises if the trajectory interrupted."""
+        if self.interrupted:
+            p = self.interruption
+            raise ValueError(
+                f"trajectory interrupted at index {p.index}: {p.message}"
+            )
+        return [(p.candidate.x, p.candidate.y) for p in self.points]
+
+    def __repr__(self):
+        return (f"TrajectoryResult(n={len(self.points)}, "
+                f"active={self.active}, interrupted={self.interrupted})")
 
 
 # ---------------------------------------------------------------------------
@@ -354,3 +455,224 @@ def undistort_points(model, xp, yp, R, *, residual_tol=1e-10,
         radial=False,
         certificate=certificate,
     )
+
+
+def _jacobian_determinant(model, x, y, xp, yp):
+    _, _, j00, j01, j11 = model.residual_and_jacobian(x, y, xp, yp)
+    return j00 * j11 - j01 * j01
+
+
+def _candidate_in_result(candidate, result, tolerance):
+    for accepted in result.candidates:
+        if (abs(accepted.x - candidate.x) <= tolerance
+                and abs(accepted.y - candidate.y) <= tolerance):
+            return accepted
+    return None
+
+
+def _orientation_compatible(model, previous, candidate, target, R):
+    """Check the local sheet orientation when the prior point is nonsingular.
+
+    Near a fold the determinant is numerically unreliable; proximity then
+    remains the caller-controlled continuity test, while every accepted
+    point is still independently residual-checked.
+    """
+    xp, yp = target
+    old_det = _jacobian_determinant(model, previous.x, previous.y, xp, yp)
+    new_det = _jacobian_determinant(model, candidate.x, candidate.y, xp, yp)
+    singular_scale = 1e-9 * max(1.0, R)
+    if abs(old_det) <= singular_scale or abs(new_det) <= singular_scale:
+        return True
+    return old_det * new_det > 0.0
+
+
+def undistort_trajectory(model, targets, R, start, *,
+                         residual_tol=1e-10,
+                         starts_per_axis=5,
+                         max_iterations=80,
+                         continuation_tol=None):
+    """Track one explicitly selected inverse branch through ``targets``.
+
+    ``start`` must be an accepted :class:`Candidate` for the first target.
+    It selects the branch; the function never chooses the lowest-residual
+    candidate automatically.  At every target the ordinary single-point
+    search is run first, so all available branches at that target are
+    independently residual-checked and returned in the point's ``result``.
+
+    Continuation is predicted by one confined Newton step sequence from
+    the previous tracked point and is accepted only if that prediction
+    reaches a verified candidate within ``continuation_tol`` (default
+    ``1e-6 * max(1, R)``) with compatible nonsingular sheet orientation.
+    If the branch disappears, cannot be locally continued, or splits far
+    enough to exceed the caller's tolerance, processing stops with status
+    ``"interrupted"``.  The other candidates found at that target are
+    retained for an explicit caller restart; they are not silently used.
+
+    An empty general-model candidate set means the finite numerical
+    search found no candidate.  It is reported as
+    ``"search_no_candidate"`` and is not a proof that no inverse exists.
+    Only the radial certificate can report ``"proven_no_solution"``.
+    """
+    if not isinstance(start, Candidate):
+        raise TypeError(
+            "start: expected an existing Candidate for the first target, "
+            f"got {type(start).__name__}"
+        )
+    if not isinstance(targets, (list, tuple)):
+        raise TypeError(
+            f"targets: expected list/tuple of (xp, yp) pairs, "
+            f"got {type(targets).__name__}"
+        )
+    if len(targets) == 0:
+        raise ValueError("targets: trajectory must contain at least one target")
+    if len(targets) > 100:
+        raise ValueError(
+            f"targets: batch size {len(targets)} exceeds the interface "
+            "limit of 100"
+        )
+
+    cleaned = []
+    for i, target in enumerate(targets):
+        if not isinstance(target, (list, tuple)) or len(target) != 2:
+            raise TypeError(
+                f"targets[{i}]: expected a (xp, yp) pair of length 2"
+            )
+        cleaned.append(finite_real_pair(
+            target[0], target[1],
+            (f"targets[{i}].xp", f"targets[{i}].yp")))
+
+    R = finite_real(R, "R")
+    if R <= 0.0:
+        raise ValueError(f"R: search box half-width must be > 0, got {R!r}")
+    residual_tol = finite_real(residual_tol, "residual_tol")
+    if residual_tol <= 0.0:
+        raise ValueError(
+            f"residual_tol: must be > 0, got {residual_tol!r}")
+    if continuation_tol is None:
+        continuation_tol = 1e-6 * max(1.0, R)
+    continuation_tol = finite_real(continuation_tol, "continuation_tol")
+    if continuation_tol <= 0.0:
+        raise ValueError(
+            "continuation_tol: must be > 0, "
+            f"got {continuation_tol!r}")
+    start_x = finite_real(start.x, "start.x")
+    start_y = finite_real(start.y, "start.y")
+    start_residual = finite_real(start.residual, "start.residual")
+    if not (-R <= start_x <= R and -R <= start_y <= R):
+        raise ValueError(
+            f"start: candidate ({start_x!r}, {start_y!r}) is outside "
+            f"[-{R!r}, {R!r}]^2"
+        )
+    if start_residual < 0.0:
+        raise ValueError(
+            f"start.residual: must be >= 0, got {start_residual!r}")
+    if not isinstance(start.method, str):
+        raise TypeError(
+            "start.method: expected str, "
+            f"got {type(start.method).__name__}")
+
+    points = []
+    match_tol = 1e-8 * max(1.0, R)
+    previous = None
+
+    for index, (xp, yp) in enumerate(cleaned):
+        result = undistort_points(
+            model, xp, yp, R,
+            residual_tol=residual_tol,
+            starts_per_axis=starts_per_axis,
+            max_iterations=max_iterations,
+        )
+
+        if index == 0:
+            matched = _candidate_in_result(start, result, match_tol)
+            if matched is None:
+                point = TrajectoryPoint(
+                    index, xp, yp, result, None, "interrupted",
+                    "start_not_verified",
+                    "the supplied start candidate was not found among "
+                    "the independently verified candidates for the first "
+                    "target; no branch was started")
+                points.append(point)
+                return TrajectoryResult(R, residual_tol, points)
+            point = TrajectoryPoint(
+                index, xp, yp, result, matched, "started", "started",
+                "trajectory started on the caller-selected, verified "
+                "candidate")
+            points.append(point)
+            previous = matched
+            continue
+
+        if not result.candidates:
+            if result.proven_no_solution:
+                reason = "proven_no_solution"
+                message = ("the radial certificate proves that this target "
+                           "has no preimage in the search box; the tracked "
+                           "branch has ended")
+            else:
+                reason = "search_no_candidate"
+                message = ("the finite single-point numerical search found "
+                           "no residual-verified candidate; this does NOT "
+                           "prove that no inverse exists")
+            points.append(TrajectoryPoint(
+                index, xp, yp, result, None, "interrupted", reason,
+                message))
+            return TrajectoryResult(R, residual_tol, points)
+
+        x, y, local_residual, local_status = _newton_solve(
+            model, (previous.x, previous.y), xp, yp, R,
+            max_iterations=max_iterations,
+            residual_tol=residual_tol,
+        )
+
+        if local_status != "converged":
+            point = TrajectoryPoint(
+                index, xp, yp, result, None, "interrupted",
+                "local_continuation_failed",
+                f"local continuation from the previous branch candidate "
+                f"ended with status {local_status!r} and residual "
+                f"{local_residual:.3e}; the verified single-point result "
+                "is retained, but no candidate was automatically selected")
+            points.append(point)
+            return TrajectoryResult(R, residual_tol, points)
+
+        predicted = Candidate(x, y, local_residual, "damped_newton")
+        matched = _candidate_in_result(predicted, result, match_tol)
+        if matched is None:
+            points.append(TrajectoryPoint(
+                index, xp, yp, result, None, "interrupted",
+                "continuation_not_verified",
+                "local continuation converged numerically, but its endpoint "
+                "was not present in the independently verified single-point "
+                "candidate set; tracking was not continued"))
+            return TrajectoryResult(R, residual_tol, points)
+
+        distance = math.hypot(matched.x - previous.x,
+                              matched.y - previous.y)
+        if distance > continuation_tol:
+            points.append(TrajectoryPoint(
+                index, xp, yp, result, None, "interrupted",
+                "branch_gap",
+                f"the verified continuation candidate moves "
+                f"{distance:.3e}, exceeding continuation_tol="
+                f"{continuation_tol:.3e}; branch continuation is not "
+                "claimed. Inspect result.candidates and restart explicitly "
+                "if another branch is desired"))
+            return TrajectoryResult(R, residual_tol, points)
+
+        if not _orientation_compatible(model, previous, matched,
+                                       (xp, yp), R):
+            points.append(TrajectoryPoint(
+                index, xp, yp, result, None, "interrupted",
+                "branch_changed",
+                "the nearest residual-verified candidate lies across a "
+                "Jacobian fold (its determinant orientation changed); "
+                "the old branch was not silently replaced by another one"))
+            return TrajectoryResult(R, residual_tol, points)
+
+        points.append(TrajectoryPoint(
+            index, xp, yp, result, matched, "tracking", "tracking",
+            "continued on the previously selected branch; the candidate "
+            "also appears in the independently verified single-point result"))
+        previous = matched
+
+    return TrajectoryResult(R, residual_tol, points)

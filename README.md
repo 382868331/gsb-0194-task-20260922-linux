@@ -45,6 +45,13 @@ res: InverseResult = m.undistort(xp, yp, R,
                                  starts_per_axis=5,    # 1..12 的真整数
                                  max_iterations=80)    # 1..10000 的真整数
 results = m.undistort_all([(xp, yp), ...], R, **同上)
+
+# 轨迹逆解：起点必须由调用方从第一帧的候选中选择
+traj = m.undistort_trajectory(
+    [(xp0, yp0), (xp1, yp1), ...], R,
+    first_result.candidates[i],             # 明确选择哪一支
+    continuation_tol=1e-6 * max(1.0, R),    # 相邻预像允许的最大移动
+    **同上)
 ```
 
 `InverseResult` 字段：
@@ -58,6 +65,35 @@ results = m.undistort_all([(xp, yp), ...], R, **同上)
 | `radial` | 是否走了纯径向上的证书路径（`p1 == p2 == 0`） |
 | `critical_radii` | 径向路径上 `g'(r)=0` 且位于盒内的临界点 |
 | `certificate` | 人类可读的证书/搜索说明（明确写出"数值搜索不证明完备"） |
+
+`TrajectoryResult` 是单点结果之上的分支跟踪模式：
+
+| 字段 | 含义 |
+|---|---|
+| `points` | 每个目标一个 `TrajectoryPoint`，直到首次中断；每点仍含完整单点 `result` |
+| `active` / `interrupted` | 是否一路保持在调用方选择的分支上 |
+| `interruption` | 首个中断点；成功时为 `None` |
+| `candidates` | 已跟踪部分的全部已验证候选 |
+| `points_xy` | 成功时返回 `(x,y)` 列表；中断时抛错，避免误把半截轨迹当完整结果 |
+
+`TrajectoryPoint.status` 只有：`"started"`（调用方选择的起点已复核）、
+`"tracking"`（同支延续并通过残差验证）和 `"interrupted"`。中断原因放在
+`reason`，对应单点结果仍可从 `point.result.candidates` 查看。
+
+轨迹模式的关键规则：
+
+- **不自动选起点**：调用方从第一帧 `InverseResult.candidates` 中选择候选；
+  该候选必须重新在第一帧完整单点搜索中被验证，否则 `start_not_verified`。
+- **每帧都验证**：先运行普通单点逆解，再用从上一候选出发的局部 Newton
+  预测延续；只有预测端点落在本帧已验证候选集合内才接受。
+- **不偷偷换支**：局部延续失败、移动超过 `continuation_tol`、或跨过 Jacobian
+  折叠导致行列式方向变化时，状态为 `interrupted`，`candidate=None`。其他候选
+  保留在该点的 `result.candidates` 中，由调用方显式重新开始。
+- **未找到不是无解**：通用数值路径某帧候选为空时原因是
+  `search_no_candidate`，且 `proven_no_solution=False`；只有纯径向证书路径
+  才可能给 `proven_no_solution`。
+- 轨迹目标同样最多 100 个；`continuation_tol` 必须是正有限实数，默认
+  `1e-6·max(1,R)`，采样较粗的连续轨迹应由调用方按运动尺度调大。
 
 `Candidate` 字段：`x, y, residual, method`；`method` 为
 `"radial_certified"` 或 `"damped_newton"`；`residual =
@@ -134,6 +170,19 @@ g'(r) = 1 + 3 k1 r² + 5 k2 r⁴
   已找到候选，该标志仍诚实保留。**有限起点+有限迭代不证明完备**，
   `certificate` 文本与 README 均显式声明。
 
+### 轨迹模式：候选选择与分支连续性
+
+轨迹模式不把一串目标当作互相独立的逆解，也不在多候选中按残差最小自动
+挑选。第一帧由调用方选定候选；后续帧从上个候选做盒内阻尼 Newton 局部
+延续，同时仍运行完整多起点单点搜索。局部预测只有在残差阈值内收敛、命中
+本帧去重后的已验证候选、空间移动不超过 `continuation_tol`，且非奇异点处
+Jacobian 行列式符号一致时才被接受。
+
+接近折叠奇异点时行列式可能接近零，轨迹允许沿调用方给定的连续容差穿过该
+数值区域；离开奇异区域后若发现方向已在另一侧，则报告 `branch_changed`。
+若原分支到达临界值后消失，局部延续不会转而选择另一个仍然存在的根，而是
+中断并返回该帧完整单点结果，供调用方决定是否在另一支上显式重启。
+
 ## 浮点结果的误差口径
 
 - 前向映射：直接按 IEEE-754 双精度求值，单份坐标的典型相对误差
@@ -177,8 +226,8 @@ distortion/__init__.py    # 公开 API
 distortion/numeric.py     # 有限实数/整数校验
 distortion/model.py       # 前向模型、解析 Jacobian、批量接口
 distortion/radial.py      # 纯径向分段单调性证书求解
-distortion/inverse.py     # 结果类型、多起点阻尼 Newton、统一入口
-tests/test_distortion.py  # 独立参考 + 20 个测试
+distortion/inverse.py     # 单点逆解、轨迹分支跟踪、结果类型
+tests/test_distortion.py  # 独立参考 + 26 个测试
 demo.py                   # 固定输入演示
 README.md
 ```

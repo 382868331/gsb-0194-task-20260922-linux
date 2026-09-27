@@ -348,6 +348,90 @@ class TestGeneralInverse(unittest.TestCase):
         self.assertAlmostEqual(y, 0.1, places=10)
 
 
+class TestTrajectoryTracking(unittest.TestCase):
+    def test_callers_candidate_is_verified_and_tracked(self):
+        m = DistortionModel(k1=-0.15, k2=0.02, p1=0.01, p2=-0.008)
+        sources = [(0.30, -0.40), (0.31, -0.405), (0.32, -0.41)]
+        targets = m.distort_all(sources)
+        first = m.undistort(*targets[0], R=1.2)
+        start = min(first.candidates,
+                    key=lambda c: math.hypot(c.x - sources[0][0],
+                                             c.y - sources[0][1]))
+
+        tr = m.undistort_trajectory(targets, 1.2, start,
+                                    continuation_tol=0.05)
+
+        self.assertTrue(tr.active)
+        self.assertEqual(len(tr.points), 3)
+        self.assertEqual(tr.points[0].status, "started")
+        self.assertTrue(all(p.status in ("started", "tracking")
+                            for p in tr.points))
+        for point, (x, y) in zip(tr.points, sources):
+            self.assertIs(point.candidate, next(
+                c for c in point.result.candidates
+                if c is point.candidate))
+            self.assertAlmostEqual(point.candidate.x, x, delta=1e-9)
+            self.assertAlmostEqual(point.candidate.y, y, delta=1e-9)
+            self.assertLessEqual(point.candidate.residual, 1e-10)
+
+    def test_disappeared_branch_interrupts_without_switching(self):
+        m = DistortionModel(k1=-0.8, k2=0.1)
+        x0 = 0.8
+        s0, _ = m.distort(x0, 0.0)
+        targets = [(s0, 0.0), (0.45, 0.0), (s0, 0.0)]
+        first = m.undistort(s0, 0.0, R=3.0)
+        start = min(first.candidates, key=lambda c: abs(c.x - x0))
+
+        tr = m.undistort_trajectory(targets, 3.0, start,
+                                    continuation_tol=0.5)
+
+        self.assertTrue(tr.interrupted)
+        self.assertEqual(tr.interruption.index, 1)
+        self.assertIsNone(tr.interruption.candidate)
+        self.assertEqual(len(tr.points), 2)
+        self.assertGreater(len(tr.interruption.result.candidates), 0)
+        self.assertFalse(tr.interruption.result.proven_no_solution)
+        self.assertIn(tr.interruption.reason,
+                      ("local_continuation_failed",
+                       "continuation_not_verified"))
+
+    def test_general_search_miss_is_not_reported_as_no_solution(self):
+        m = DistortionModel(k1=-0.8, k2=0.1, p1=1e-4)
+        first = m.undistort(0.3, 0.0, R=1.0)
+        start = first.candidates[0]
+
+        tr = m.undistort_trajectory([(0.3, 0.0), (100.0, 0.0)], 1.0,
+                                    start, continuation_tol=10.0)
+
+        self.assertTrue(tr.interrupted)
+        self.assertEqual(tr.interruption.reason, "search_no_candidate")
+        self.assertFalse(tr.interruption.result.proven_no_solution)
+        self.assertEqual(tr.interruption.result.candidates, [])
+        self.assertIn("does NOT prove", tr.interruption.message)
+
+    def test_radial_no_solution_is_distinctly_certified(self):
+        m = DistortionModel()
+        start = m.undistort(0.2, 0.0, 1.0).candidates[0]
+
+        tr = m.undistort_trajectory([(0.2, 0.0), (1.5, 0.0)], 1.0,
+                                    start, continuation_tol=10.0)
+
+        self.assertTrue(tr.interrupted)
+        self.assertEqual(tr.interruption.reason, "proven_no_solution")
+        self.assertTrue(tr.interruption.result.proven_no_solution)
+
+    def test_start_must_be_an_independently_verified_candidate(self):
+        m = DistortionModel(k1=-0.15, k2=0.02, p1=0.01, p2=-0.008)
+        target = m.distort(0.3, -0.4)
+        fake = Candidate(0.5, 0.5, 0.0, "damped_newton")
+
+        tr = m.undistort_trajectory([target], 1.2, fake)
+
+        self.assertTrue(tr.interrupted)
+        self.assertEqual(tr.interruption.reason, "start_not_verified")
+        self.assertIsNone(tr.interruption.candidate)
+
+
 class TestValidation(unittest.TestCase):
     def test_reject_non_finite(self):
         m = DistortionModel()

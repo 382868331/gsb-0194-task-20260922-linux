@@ -2,8 +2,9 @@
 
 Public API:
     DistortionModel  -- forward/distort and inverse/undistort operations
-    Candidate        -- one accepted inverse candidate
-    InverseResult    -- all accepted, de-duplicated candidates plus flags
+    Candidate            -- one accepted inverse candidate
+    InverseResult        -- single-point candidates plus flags
+    TrajectoryResult     -- branch-tracked inverse trajectory result
     finite_real      -- input validation helper
 
 Only Python 3.14 standard library is used.  This module implements the
@@ -12,12 +13,16 @@ model compatibility.
 """
 
 from .model import DistortionModel
-from .inverse import Candidate, InverseResult
+from .inverse import (Candidate, InverseResult, TrajectoryPoint,
+                      TrajectoryResult, undistort_trajectory)
 from .numeric import finite_real
 
 __all__ = [
     "DistortionModel",
     "Candidate",
     "InverseResult",
+    "TrajectoryPoint",
+    "TrajectoryResult",
+    "undistort_trajectory",
     "finite_real",
 ]

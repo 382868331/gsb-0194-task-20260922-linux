@@ -96,6 +96,13 @@ class DistortionModel:
         return [undistort_points(self, tx, ty, R, **kwargs)
                 for (tx, ty) in cleaned]
 
+    def undistort_trajectory(self, targets, R, start, **kwargs):
+        """Track a caller-selected inverse branch; see
+        :func:`distortion.inverse.undistort_trajectory`.
+        """
+        from .inverse import undistort_trajectory
+        return undistort_trajectory(self, targets, R, start, **kwargs)
+
     def _distort(self, x, y):
         r2 = x * x + y * y
         radial = 1.0 + (self.k1 + self.k2 * r2) * r2

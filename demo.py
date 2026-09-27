@@ -7,8 +7,9 @@ Runs real computation (no sleep, no pre-recorded results) and prints:
      with its forward residual, plus the radial uniqueness certificate,
   3. the same fold with a small tangential term solved by multi-start
      damped Newton,
-  4. a proven no-solution case, and
-  5. actually triggered input rejections.
+  4. a proven no-solution case,
+  5. branch-tracked trajectory continuation/interruption, and
+  6. actually triggered input rejections.
 
 Run:  python demo.py     (completes in well under 8 seconds)
 """
@@ -41,6 +42,20 @@ def show_result(model, result):
               f"residual = {c.residual:.3e}  [{c.method}]  "
               f"reprojects to ({back_x: .9f}, {back_y: .9f})")
     print(f"  certificate: {result.certificate}")
+
+
+def show_trajectory(trajectory):
+    for point in trajectory.points:
+        if point.candidate is None:
+            print(f"    [{point.index}] {point.status} ({point.reason}): "
+                  f"{point.message}")
+            print(f"        single-point candidates available for explicit "
+                  f"restart: {len(point.result.candidates)}")
+        else:
+            print(f"    [{point.index}] {point.status}: "
+                  f"(x, y) = ({point.candidate.x: .10f}, "
+                  f"{point.candidate.y: .10f}), "
+                  f"residual = {point.candidate.residual:.3e}")
 
 
 def main():
@@ -87,7 +102,32 @@ def main():
     print(f"  undistort({far_x}, 0, R=1) with the identity model:")
     show_result(identity, result3)
 
-    banner("5. Actually triggered rejection / exception boundaries")
+    banner("5. Trajectory mode: branch continuation without silent switching")
+    track_model = DistortionModel(k1=-0.15, k2=0.02, p1=0.01, p2=-0.008)
+    sources = [(0.30, -0.40), (0.31, -0.405), (0.32, -0.41)]
+    track_targets = track_model.distort_all(sources)
+    first_result = track_model.undistort(*track_targets[0], R=1.2)
+    selected = first_result.candidates[0]
+    print("  caller explicitly selects the first verified candidate:")
+    show_result(track_model, first_result)
+    tracked = track_model.undistort_trajectory(
+        track_targets, 1.2, selected, continuation_tol=0.05)
+    show_trajectory(tracked)
+
+    # A folding radial branch that reaches a critical value and ends:
+    # other roots can still exist at the new target, but they are left
+    # for an explicit restart rather than used automatically.
+    folded = DistortionModel(k1=-0.8, k2=0.1)
+    s_start, _ = folded.distort(0.8, 0.0)
+    folded_first = folded.undistort(s_start, 0.0, R=3.0)
+    folded_start = min(folded_first.candidates, key=lambda c: abs(c.x - 0.8))
+    broken = folded.undistort_trajectory(
+        [(s_start, 0.0), (0.45, 0.0)], 3.0, folded_start,
+        continuation_tol=0.5)
+    print("  a folded branch that ends is interrupted, not switched:")
+    show_trajectory(broken)
+
+    banner("6. Actually triggered rejection / exception boundaries")
     demonstrations = []
 
     def attempt(label, fn):
